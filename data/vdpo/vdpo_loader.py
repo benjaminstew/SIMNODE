@@ -33,7 +33,7 @@ class VanDerPolOscillator:
 
         return np.array([dudt, dvdt], dtype=np.float32)
     
-def create_vdpo_dataset(num_nodes, end_time, add_noise=True, noise_sd=0.1): 
+def create_vdpo_dataset(num_nodes, end_time, add_noise=True, noise_sd=None): 
     '''
     Computes single trajectory of VDPO state over [0, end_time] and splits into 50/50 train set and test set.
     
@@ -68,13 +68,13 @@ def create_vdpo_dataset(num_nodes, end_time, add_noise=True, noise_sd=0.1):
         method='RK45'
     )
     full_trajectory = solution.y.T # (num_nodes, state_dim)
-    smooth_trajectory = full_trajectory.copy()
+    full_smooth_trajectory = full_trajectory.copy()
 
     #4. Extract train/test rows by matching grid values
     train_idx = np.isin(full_grid, train_grid)
     test_idx  = np.isin(full_grid, test_grid)
     train_trajectory = full_trajectory[train_idx, :] # (half_nodes, state_dim)
-    train_trajectory_smooth = smooth_trajectory[train_idx, :]
+    train_smooth_trajectory = full_smooth_trajectory[train_idx, :]
     test_trajectory = full_trajectory[test_idx, :] # (half_nodes, state_dim)
 
     #5. Add Gaussian noise to training data only
@@ -82,4 +82,4 @@ def create_vdpo_dataset(num_nodes, end_time, add_noise=True, noise_sd=0.1):
         noise = np.random.randn(*train_trajectory.shape).astype(np.float32) * float(noise_sd)
         train_trajectory += noise
 
-    return train_interpol, test_interpol, full_grid, smooth_trajectory, train_grid, train_trajectory, train_trajectory_smooth, test_grid, test_trajectory
+    return train_interpol, train_grid, train_trajectory, test_interpol, test_grid, test_trajectory, full_grid, full_smooth_trajectory, train_smooth_trajectory

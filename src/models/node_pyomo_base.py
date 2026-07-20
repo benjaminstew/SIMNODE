@@ -8,6 +8,7 @@ from scipy.integrate import solve_ivp
 import pyomo.environ as pyo
 from pyomo.opt import SolverStatus, TerminationCondition
 from src.models.direct_collocation import BarycentricInterpolation
+from src.models.node_pyomo_inference import CollocationInference
 
 class NODEPyomo:
     """
@@ -314,8 +315,9 @@ class NODEPyomo:
             solver_options: dictionary of solver options specific to the transcription method used.
         '''
         # set up IPOPT solver
-        solver = pyo.SolverFactory("ipopt", executable="/usr/local/bin/ipopt")
-        print("Solver available?: {}".format(solver.available())) 
+        #solver = pyo.SolverFactory("ipopt", executable="/usr/local/bin/ipopt")
+        solver = pyo.SolverFactory("ipopt", executable="/opt/homebrew/bin/ipopt")
+        #print("Solver available?: {}".format(solver.available())) 
         #print("\nInitial NN parameter summary stats (pre-IPOPT): ")
         #self.check_param_values()
         
@@ -323,7 +325,6 @@ class NODEPyomo:
         solver.options['max_iter'] = solver_options["max_iter"]
         solver.options['nlp_scaling_method'] = solver_options["nlp_scaling_method"]
         solver.options['mu_strategy'] = solver_options["mu_strategy"]
-        solver.options['print_level'] = 5
         solver.options['tol'] = solver_options["tol"] 
         solver.options['acceptable_tol'] = solver_options["acceptable_tol"]
         solver.options['acceptable_iter'] = solver_options["acceptable_iter"]
@@ -388,10 +389,10 @@ class NODEPyomo:
 
     def get_predicted_trajectory(self, 
             y_0, t_grid,
-            method: str='RK45',
-            rtol: float= 1e-3,
-            atol: float= 1e-6,
-            max_step: float= np.inf
+            method: str = 'RK45',
+            rtol: float = 1e-3,
+            atol: float = 1e-6,
+            max_step: float = np.inf
     ):
         '''
         Predict state trajectory over t_grid via forward integration of the trained NN using scipy.solve_ivp.

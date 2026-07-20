@@ -98,7 +98,7 @@ class MPWorker:
             self.submodel.model.dual_var_bs[l].b.store_values(self.ndarray_to_dict(dual_var_bs[l-1]))
 
             # warm start submodel from consensus params (to help convergence)
-            if iteration_count > 0: 
+            if iteration_count > 1: 
                 self.submodel.model.Ws[l].W.set_values(self.ndarray_to_dict(consensus_Ws[l-1]))
                 self.submodel.model.bs[l].b.set_values(self.ndarray_to_dict(consensus_bs[l-1]))
                 #print(f"\nWORKER {self.worker_id}: WARM START FROM CONSENSUS PARAMS FOR LAYER {l}.\n")
@@ -328,6 +328,11 @@ class ADMM:
 
     # I can make this simpler 
     def run_admm_training(self, solver_options: dict, mse_eval_options: dict = None):
+        near_primal_conv_tol = self.admm_primal_residual_tol * 0.5
+        near_primal_conv_count = 0 
+        near_mse_conv_tol = self.admm_train_mse_tol * 0.5
+        near_mse_convergence_count = 0
+
         t_start = time.perf_counter()
         try:
             for iteration in range(self.max_admm_iterations):
@@ -368,18 +373,26 @@ class ADMM:
                     t_start += time.perf_counter() - t_eval0  # exclude eval cost from timer
 
                 # check ADMM convergence based on primal residual or train MSE or both 
-                if self.admm_primal_residual_tol is not None:  
+                if self.admm_primal_residual_tol is not None: 
+                    if r_primal <= self.admm_primal_residual_tol + near_primal_conv_tol:
+                            near_primal_conv_count += 1
                     if self.admm_train_mse_tol is not None:
-                        if r_primal <= self.admm_primal_residual_tol and train_mse <= self.admm_train_mse_tol:
+                        if train_mse <= self.admm_train_mse_tol + near_mse_conv_tol:
+                            near_mse_convergence_count += 1
+                        if (r_primal <= self.admm_primal_residual_tol or near_primal_conv_count >= 5) and (train_mse <= self.admm_train_mse_tol or near_mse_convergence_count >= 5):
                             print(f"ADMM converged (wrt primal residual and train MSE) after {self.iteration_count} iterations!")
                             break        
-                    elif r_primal <= self.admm_primal_residual_tol:
+                    elif r_primal <= self.admm_primal_residual_tol or near_primal_conv_count >= 5:
                         print(f"ADMM converged (wrt primal residual)after {self.iteration_count} iterations!")
                         break
+                
                 elif self.admm_train_mse_tol is not None:
-                    if train_mse <= self.admm_train_mse_tol:
+                    if train_mse <= self.admm_train_mse_tol + near_mse_conv_tol:
+                            near_mse_convergence_count += 1
+                    if train_mse <= self.admm_train_mse_tol or near_mse_convergence_count >= 5:
                         print(f"ADMM converged (wrt train MSE) after {self.iteration_count} iterations!")
-                        break
+                        break         
+                
                 else:
                     raise ValueError("NO ADMM CONVERGENCE CRITERIA SPECIFIED.")
 

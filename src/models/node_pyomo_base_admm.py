@@ -381,8 +381,19 @@ class NODEPyomo:
         solver.options['acceptable_iter'] = solver_options["acceptable_iter"]
 
         t0 = time.perf_counter()
-        result = solver.solve(self.model, tee=True)
+        # load_solutions=False so an IPOPT 'error' exit (e.g. NaN in a function
+        # evaluation for a hard submodel, which can occur sporadically across the
+        # multiprocessing pool) does NOT raise inside solve() and crash the whole run.
+        # We load the solution manually only when the solver actually returned one.
+        result = solver.solve(self.model, tee=True, load_solutions=False)
         solve_wall_time = time.perf_counter() - t0
+
+        solution_loaded = (
+            len(result.solution) > 0
+            and result.solver.status in (SolverStatus.ok, SolverStatus.warning)
+        )
+        if solution_loaded:
+            self.model.solutions.load_from(result)
 
         iterations = getattr(result.solver, "iterations", None)
         self.last_solve_info = {
@@ -390,18 +401,24 @@ class NODEPyomo:
             "termination_condition": str(result.solver.termination_condition),
             "iterations": int(iterations) if iterations is not None else None,
             "solve_wall_time_s": solve_wall_time,
+            "solution_loaded": solution_loaded,
         }
-            
-        if result.solver.status == SolverStatus.ok and (result.solver.termination_condition == TerminationCondition.optimal):
+
+        if solution_loaded and result.solver.termination_condition == TerminationCondition.optimal:
             if not self.admm_submodel:
                 self.freeze_vars()
                 print("\nSolve time {:.1f}s for {} iterations\n".format(solve_wall_time, iterations))
                 #print("NN parameters have been frozen")
             #print("Solution is feasible and optimal\n\n")
-            #print("\nFinal NN parameter summary stats (post-IPOPT): ")
-            #self.check_param_values()
+        elif not solution_loaded:
+            # No usable solution: the submodel keeps its warm-start (consensus) params
+            # for this ADMM iteration rather than aborting the run.
+            print("Submodel solve returned no usable solution "
+                  "(status={}, termination={}); keeping warm-start params for this batch.".format(
+                      result.solver.status, result.solver.termination_condition))
         else:
-            print("Solution is not feasible and/or not optimal: {}".format(str(result.solver)))
+            print("Solution loaded but not optimal (termination={}); using last iterate.".format(
+                result.solver.termination_condition))
 
     
     # ------------------------------ DIAGNOSTIC & MISC METHODS ------------------------------- #
