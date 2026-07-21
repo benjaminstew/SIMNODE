@@ -7,9 +7,9 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from src.models.admm_mp import ADMM
-from src.models.node_pyomo_inference import CollocationInference
-from src.models.node_torch_base import train_sequential_multitraj
+from src.models.simultaneous.admm_mp import ADMM
+from src.models.simultaneous.node_pyomo_inference import CollocationInference
+from src.models.sequential.node_torch_base import train_sequential_multitraj
 
 def main():
     # import training data

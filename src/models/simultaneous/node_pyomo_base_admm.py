@@ -1,28 +1,27 @@
 # currently lacks customisation on the numerical analysis methods used, interpolation scheme used, ML architecture used, param initialisation methods, etc...
-from pyexpat import model
 import warnings
 import numpy as np 
 import time
-from pathlib import Path
 from scipy.integrate import solve_ivp
 import pyomo.environ as pyo
 from pyomo.opt import SolverStatus, TerminationCondition
-from src.models.direct_collocation import BarycentricInterpolation
-from src.models.node_pyomo_inference import CollocationInference
+from src.models.simultaneous.direct_collocation import BarycentricInterpolation
 
 class NODEPyomo:
     """
-    Implementation of a base optimisation model to train direct collocation-based Neural ODEs using Pyomo and the IPOPT solver. 
+    Implementation of a base Pyomo model to train collocation-based Neural ODEs using the IPOPT solver. 
+    Additional methods for ADMM-based batched training are implemented.
     I have tried to make the code as scalable as possible with NN size etc., but there are still may improvements to be made.
     """
     def __init__(self, 
             Y_obs, layer_sizes, end_time, 
             state_lower_bound, state_upper_bound, 
             param_lower_bound, param_upper_bound,
-            lambda_reg, 
-            Y_smooth=None, 
+            l2_reg_param, 
+            admm_submodel=False, 
+            admm_penalty_param=None,
             transcription_method='dc',
-            rho_reg=None,
+            residual_reg_param=None,
             num_res_eval_nodes=None, 
     ):
         self.Y_obs = Y_obs # observed state trajectory from measurements. ndarray (num_nodes, state_dim)
@@ -47,22 +46,27 @@ class NODEPyomo:
         self.state_upper_bound = state_upper_bound
         self.param_lower_bound = param_lower_bound
         self.param_upper_bound = param_upper_bound
-        self.lambda_reg = lambda_reg # regularisation hyperparameter for loss function 
-        self.Y_smooth = Y_smooth if Y_smooth is not None else Y_obs # noise-free trajectory for Y_star init
+        self.lambda_reg = l2_reg_param # regularisation hyperparameter for loss function 
         
         self.transcription_method = transcription_method
-
         if self.transcription_method == 'irrdc': 
-            if rho_reg is None or num_res_eval_nodes is None:
-                raise ValueError("Need to set hyperparameter rho_reg and num_res_eval_nodes for IRRDC method.")
+            if residual_reg_param is None or num_res_eval_nodes is None:
+                raise ValueError("Need to set hyperparameter residual_reg_param and num_res_eval_nodes for IRRDC method.")
             self.num_res_eval_nodes = num_res_eval_nodes
             self.res_eval_grid = bary.res_eval_grid
             self.L_res = bary.L_res
             self.D_res = bary.D_res
-            self.rho_reg = rho_reg # regularisation hyperparameter for residual penalty term 
+            self.rho_reg = residual_reg_param # regularisation hyperparameter for residual penalty term 
             self.quadrature_ws = bary.quadrature_ws # quadrature weights for residual penalty term
+
+        self.admm_submodel = admm_submodel
+        if admm_submodel:
+            if admm_penalty_param is None:
+                raise ValueError("Must set penalty hyperparameter admm_penalty_param for ADMM submodel.")  
+            self.nu_reg = admm_penalty_param # ADMM penalty parameter for consensus penalty term 
         
         self.build_model()
+
 
     # ------------------------------ BASE MODEL BUILDING METHODS ------------------------------- #
 
@@ -72,7 +76,7 @@ class NODEPyomo:
         def init_rule(model, i, j):
             return W[i-1, j-1] # W is a 0-indexed ndarray 
         return init_rule
-
+    
     def initialise_bias(self, shape):
         '''Normal random initialisation of a bias vector as pyomo Var'''
         b = np.random.randn(*shape) * 0.1
@@ -100,13 +104,8 @@ class NODEPyomo:
     
     def initialise_Y_star(self):
         '''Initialisation of the approximate state trajectory Y_star as a pyomo Var using smooth data.'''
-        if self.Y_smooth is None:
-            def init_rule(model, m, d):
-                return self.Y_obs[m-1, d-1] * np.random.randn() * 0.1 # self.Y_obs is a 0-indexed ndarray
-        else:
-            def init_rule(model, m, d):
-                if self.Y_smooth is not None:
-                    return self.Y_smooth[m-1, d-1] # self.Y_smooth is a 0-indexed ndarray
+        def init_rule(model, m, d):
+            return self.Y_obs[m-1, d-1] + np.random.randn() * 0.1 # self.Y_obs is a 0-indexed ndarray
         return init_rule
     
     def dc_objective_rule(self, model):
@@ -132,11 +131,25 @@ class NODEPyomo:
 
         reg_l2_norm = self.lambda_reg * l2_norm
 
+        if self.admm_submodel:
+            # ADMM consensus penalty term: (nu/2) * ||theta - theta_consensus + (1/nu) * dual_var||_2^2
+            consensus_penalty = (self.nu_reg / 2) * (sum(
+                (model.Ws[l].W[i, j] - model.consensus_Ws[l].W[i, j] + (1 / self.nu_reg) * model.dual_var_Ws[l].W[i, j])**2
+                for l in model.l
+                for i in range(1, self.layer_sizes[l-1] + 1) 
+                for j in range(1, self.layer_sizes[l] + 1)    
+            ) + sum(
+                (model.bs[l].b[1, j] - model.consensus_bs[l].b[1, j] + (1 / self.nu_reg) * model.dual_var_bs[l].b[1, j])**2
+                for l in model.l
+                for j in range(1, self.layer_sizes[l] + 1)
+            ))
+            return mse + reg_l2_norm + consensus_penalty
+
         return mse + reg_l2_norm
     
     def irrdc_objective_rule(self, model, nn_output_res):
         '''Returns the objective function for IRR-DC'''
-        # Regularised MSE term: (1/N) * ||Y_star - Y_obs||_F^2 + lambda * ||theta||_2^2
+        # DC terms (& ADMM consensus penalty term if applicable)
         reg_mse = self.dc_objective_rule(model) 
 
         # Residual penalty term: (1 / (2 * rho)) * sum_n(w_m * ||interpolant_m||_2^2) 
@@ -247,10 +260,48 @@ class NODEPyomo:
         else:
             nn_output_res = None
 
-        # Build Pyomo objective function based on transcription method used 
+        #---- ADMM CONSENUS PARAMETERS AND DUAL VARIABLES -----
+        if self.admm_submodel:
+            # Make ADMM consensus params and dual vars mutable Pyomo Params
+            self.model.consensus_Ws = pyo.Block(self.model.l) 
+            self.model.consensus_bs = pyo.Block(self.model.l) 
+            self.model.dual_var_Ws = pyo.Block(self.model.l)
+            self.model.dual_var_bs = pyo.Block(self.model.l)
+
+            for l in self.model.l: 
+                self.model.consensus_Ws[l].W = pyo.Param(
+                    {i for i in range(1, self.layer_sizes[l-1] + 1)},  
+                    {j for j in range(1, self.layer_sizes[l] + 1)},
+                    domain=pyo.Reals,
+                    initialize=0.0,
+                    mutable=True
+                )
+                self.model.consensus_bs[l].b = pyo.Param(
+                    {1},
+                    {i for i in range(1, self.layer_sizes[l] + 1)},
+                    domain=pyo.Reals,
+                    initialize=0.0,
+                    mutable=True
+                )
+                self.model.dual_var_Ws[l].W = pyo.Param(
+                    {i for i in range(1, self.layer_sizes[l-1] + 1)}, 
+                    {j for j in range(1, self.layer_sizes[l] + 1)},
+                    domain=pyo.Reals,
+                    initialize=0.0,
+                    mutable=True
+                )
+                self.model.dual_var_bs[l].b = pyo.Param(
+                    {1},
+                    {i for i in range(1, self.layer_sizes[l] + 1)}, 
+                    domain=pyo.Reals,
+                    initialize=0.0,
+                    mutable=True
+                )
+
+        # Build Pyomo objective function based on transcription method
         self.build_objective(nn_output_res)
 
-        # Build Pyomo constraints based on transcription method used
+        # Build Pyomo DC constraints 
         self.build_constraints(nn_output_colloc)
 
     def build_objective(self, nn_output_res):
@@ -301,7 +352,7 @@ class NODEPyomo:
         return activations[-1]
     
     def freeze_vars(self):
-        '''Fix values of vars in pyomo model'''
+        '''Freeze values of vars in pyomo model'''
         self.model.Y_star.fix() 
         for l in self.model.l:
             self.model.Ws[l].W.fix()
@@ -315,27 +366,34 @@ class NODEPyomo:
             solver_options: dictionary of solver options specific to the transcription method used.
         '''
         # set up IPOPT solver
+        #solver = pyo.SolverFactory("ipopt", executable="/rds/general/user/bms125/home/miniforge3/envs/cnode/bin/ipopt") # HPC
         #solver = pyo.SolverFactory("ipopt", executable="/usr/local/bin/ipopt")
-        solver = pyo.SolverFactory("ipopt", executable="/opt/homebrew/bin/ipopt")
+        solver = pyo.SolverFactory("ipopt", executable="/opt/homebrew/bin/ipopt") 
         #print("Solver available?: {}".format(solver.available())) 
-        #print("\nInitial NN parameter summary stats (pre-IPOPT): ")
-        #self.check_param_values()
         
         # set global solver options
         solver.options['max_iter'] = solver_options["max_iter"]
         solver.options['nlp_scaling_method'] = solver_options["nlp_scaling_method"]
         solver.options['mu_strategy'] = solver_options["mu_strategy"]
+        solver.options['print_level'] = solver_options["print_level"]
         solver.options['tol'] = solver_options["tol"] 
         solver.options['acceptable_tol'] = solver_options["acceptable_tol"]
         solver.options['acceptable_iter'] = solver_options["acceptable_iter"]
-        repo_root = Path(__file__).resolve().parents[2]
-        option_path = repo_root / "ipopt.opt"
-        if option_path.exists():
-            solver.options["option_file_name"] = str(option_path)
 
         t0 = time.perf_counter()
-        result = solver.solve(self.model, tee=True)
+        # load_solutions=False so an IPOPT 'error' exit (e.g. NaN in a function
+        # evaluation for a hard submodel, which can occur sporadically across the
+        # multiprocessing pool) does NOT raise inside solve() and crash the whole run.
+        # We load the solution manually only when the solver actually returned one.
+        result = solver.solve(self.model, tee=True, load_solutions=False)
         solve_wall_time = time.perf_counter() - t0
+
+        solution_loaded = (
+            len(result.solution) > 0
+            and result.solver.status in (SolverStatus.ok, SolverStatus.warning)
+        )
+        if solution_loaded:
+            self.model.solutions.load_from(result)
 
         iterations = getattr(result.solver, "iterations", None)
         self.last_solve_info = {
@@ -343,19 +401,31 @@ class NODEPyomo:
             "termination_condition": str(result.solver.termination_condition),
             "iterations": int(iterations) if iterations is not None else None,
             "solve_wall_time_s": solve_wall_time,
+            "solution_loaded": solution_loaded,
         }
-            
-        if result.solver.status == SolverStatus.ok and (result.solver.termination_condition == TerminationCondition.optimal):
-            print("Solution is feasible and optimal")
-            self.freeze_vars()
-            print("NN parameters have been frozen")
-            #print("\nFinal NN parameter summary stats (post-IPOPT): ")
-            #self.check_param_values()
+
+        if solution_loaded and result.solver.termination_condition == TerminationCondition.optimal:
+            if not self.admm_submodel:
+                self.freeze_vars()
+                print("\nSolve time {:.1f}s for {} iterations\n".format(solve_wall_time, iterations))
+                #print("NN parameters have been frozen")
+            #print("Solution is feasible and optimal\n\n")
+        elif not solution_loaded:
+            # No usable solution: the submodel keeps its warm-start (consensus) params
+            # for this ADMM iteration rather than aborting the run.
+            print("Submodel solve returned no usable solution "
+                  "(status={}, termination={}); keeping warm-start params for this batch.".format(
+                      result.solver.status, result.solver.termination_condition))
         else:
-            print("Solution is not feasible and/or not optimal: {}".format(str(result.solver)))
+            print("Solution loaded but not optimal (termination={}); using last iterate.".format(
+                result.solver.termination_condition))
 
     
-    # ------------------------------ DIAGNOSTIC METHODS ------------------------------- #
+    # ------------------------------ DIAGNOSTIC & MISC METHODS ------------------------------- #
+
+    def pyomo_var_to_numpy(self, pyo_obj, shape): 
+        '''Copy pyo_obj (a Pyomo Var/Param/Expression) into a numpy ndarray.'''
+        return np.array([[pyo.value(pyo_obj[i, j]) for j in range(1, shape[1]+1)] for i in range(1, shape[0]+1)])
     
     def check_param_values(self):
         '''Print summary statistics for NN parameters.'''
@@ -364,81 +434,3 @@ class NODEPyomo:
             b = self.pyomo_var_to_numpy(self.model.bs[l].b, (1, self.layer_sizes[l]))
             print(f"Layer {l}: W range [{W.min():.4f}, {W.max():.4f}], |W| mean {np.abs(W).mean():.4f}")
             print(f"Layer {l}: b range [{b.min():.4f}, {b.max():.4f}], |b| mean {np.abs(b).mean():.4f}")
-
-
-    # ---------------------------- PREDICTION METHODS -------------------------------- #
-
-    def pyomo_var_to_numpy(self, pyo_obj, shape): 
-        '''Copy pyo_obj (a Pyomo Var/Param/Expression) into a numpy ndarray.'''
-        return np.array([[pyo.value(pyo_obj[i, j]) for j in range(1, shape[1]+1)] for i in range(1, shape[0]+1)])
-    
-    def convert_weights(self):
-        return [self.pyomo_var_to_numpy(self.model.Ws[l].W, (self.layer_sizes[l-1], self.layer_sizes[l])) for l in self.model.l]
-    
-    def convert_biases(self):
-        return [self.pyomo_var_to_numpy(self.model.bs[l].b, (1, self.layer_sizes[l])) for l in self.model.l]
-    
-    def nn_prediction(self, t, y_0, Ws, bs): 
-        y_0 = y_0.reshape(1, -1) # reshape to row vector
-        out = np.tanh(np.dot(y_0, Ws[0]) + bs[0]) # first hidden layer
-        for W, b in zip(Ws[1:-1], bs[1:-1]): 
-            out = np.tanh(np.dot(out, W) + b) # calc activation for hidden layer, move forward
-        out = np.dot(out, Ws[-1]) + bs[-1] # linear output layer
-        
-        return out.flatten() # return 1D array for solve_ivp
-
-    def get_predicted_trajectory(self, 
-            y_0, t_grid,
-            method: str = 'RK45',
-            rtol: float = 1e-3,
-            atol: float = 1e-6,
-            max_step: float = np.inf
-    ):
-        '''
-        Predict state trajectory over t_grid via forward integration of the trained NN using scipy.solve_ivp.
-
-        Args:
-            y_0: Initial state, ndarray (state_dim,). Must be 1D for scipy.solve_ivp.
-            t_grid: Strictly increasing time grid, ndarray (num_nodes, ).
-            method: solve_ivp method (e.g. 'RK45', 'DOP853', 'Radau', 'BDF').
-            rtol, atol, max_step: solve_ivp tolerances/step control.
-
-        Returns:
-            Predicted state trajectory as ndarray (num_nodes, state_dim).
-        '''
-        if t_grid.ndim != 1 or t_grid.size < 2:
-            raise ValueError(f"t_grid must be a 1D array with >=2 points; got shape {t_grid.shape}.")
-        if not np.all(np.isfinite(t_grid)):
-            raise ValueError("t_grid must contain only finite values.")
-        if np.any(np.diff(t_grid) <= 0):
-            raise ValueError("t_grid must be strictly increasing (solve_ivp expects monotone time).")
-
-        if y_0.ndim != 1:
-            raise ValueError(f"y_0 must be 1D; got shape {y_0.shape}.")
-        if hasattr(self, 'state_dim') and y_0.shape[0] != self.state_dim:
-            raise ValueError(f"y_0 has length {y_0.shape[0]} but state_dim is {self.state_dim}.")
-        if not np.all(np.isfinite(y_0)):
-            raise ValueError("y_0 must contain only finite values.")
-
-        Ws = self.convert_weights()
-        bs = self.convert_biases()
-
-        predicted_trajectory = solve_ivp(
-            fun=self.nn_prediction,
-            t_span=(t_grid[0], t_grid[-1]),
-            y0=y_0,
-            t_eval=t_grid,
-            method=method,
-            rtol=rtol,
-            atol=atol,
-            max_step=max_step,
-            args=(Ws, bs)
-        )
-        
-        if not predicted_trajectory.success:
-            raise RuntimeError("solve_ivp failed: " f"status={predicted_trajectory.status}, message={predicted_trajectory.message}")
-
-        return predicted_trajectory.y.T
-
-
-

@@ -1,4 +1,5 @@
-from src.models.node_pyomo_base_admm import NODEPyomo
+'''multiprocessing wrapper to organize NODEPyomo submodels for ADMM-based batched training.'''
+from src.models.simultaneous.node_pyomo_base_admm import NODEPyomo
 import numpy as np
 import time
 import threading
@@ -7,7 +8,7 @@ from scipy.integrate import solve_ivp
 
 # ---- MODULE LEVEL FUNCTIONS (required for mp.Pool pickling) ----
 WORKER = None   # child processes (independent memory) each have own WORKER instance
-BARRIER = None  # shared barrier enforcing a strict 1:1 task->worker mapping per round
+BARRIER = None  # shared barrier enforcing a strict 1:1 task->worker mapping 
 
 def init_worker(id_queue: mp.Queue, submodel_config: dict, barrier):
     global WORKER, BARRIER
@@ -27,12 +28,9 @@ def solve_worker(payload: dict):
         WORKER.solve_submodel(payload["solver_options"])
         return (WORKER.worker_id, WORKER.submodel_Ws, WORKER.submodel_bs)
     finally:
-        # Block here until ALL workers have finished their one task. A worker cannot
-        # return (and therefore cannot pull a second task from the pool queue) until
-        # every worker is at the barrier — guaranteeing each of the N tasks lands on a
-        # distinct worker, i.e. a strict 1:1 mapping of batch -> worker each round.
-        # In finally so a failed solve still releases the barrier (no deadlock); the
-        # exception then still propagates to the main process via pool.map.
+        # Barrier blocks each worker until all N have finished, forcing strict 1:1 batch->worker mapping 
+        # (no worker starts a second task early). In finally so a failed solve still releases the barrier instead of
+        # deadlocking; the exception still propagates via pool.map
         if BARRIER is not None:
             try:
                 BARRIER.wait()

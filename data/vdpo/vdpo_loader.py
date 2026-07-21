@@ -1,6 +1,6 @@
 import numpy as np
 from scipy.integrate import solve_ivp
-from src.models.direct_collocation import BarycentricInterpolation
+from src.models.simultaneous.direct_collocation import BarycentricInterpolation
 
 class VanDerPolOscillator:
     """

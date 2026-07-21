@@ -32,7 +32,7 @@ import pyomo.environ as pyo
 from pyomo.opt import SolverStatus, TerminationCondition
 from scipy.integrate import solve_ivp
 
-from src.models.direct_collocation import BarycentricInterpolation
+from src.models.simultaneous.direct_collocation import BarycentricInterpolation
 
 
 def make_ipopt_solver(solver_options):
