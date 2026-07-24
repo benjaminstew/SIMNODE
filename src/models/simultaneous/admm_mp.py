@@ -1,5 +1,5 @@
 '''multiprocessing wrapper to organize NODEPyomo submodels for ADMM-based batched training.'''
-from src.models.simultaneous.node_pyomo_base_admm import NODEPyomo
+from src.models.simultaneous.node_pyomo_admm import NODEPyomo
 import numpy as np
 import time
 import threading
@@ -37,7 +37,6 @@ def solve_worker(payload: dict):
             except threading.BrokenBarrierError:
                 pass
 
-
 class MPWorker:
     '''
     Wraps a NODEPyomo submodel and handles all Pyomo <-> numpy parameter communication.
@@ -61,6 +60,7 @@ class MPWorker:
             transcription_method=submodel_config['transcription_method'],
             residual_reg_param=submodel_config['residual_reg_param'],
             num_res_eval_nodes=submodel_config['num_res_eval_nodes'],
+            obs_times=submodel_config['obs_times'],
         )
         self.submodel_Ws = [0 for _ in range(len(self.layer_sizes) - 1)]
         self.submodel_bs = [0 for _ in range(len(self.layer_sizes) - 1)]
@@ -100,7 +100,6 @@ class MPWorker:
                 self.submodel.model.Ws[l].W.set_values(self.ndarray_to_dict(consensus_Ws[l-1]))
                 self.submodel.model.bs[l].b.set_values(self.ndarray_to_dict(consensus_bs[l-1]))
                 #print(f"\nWORKER {self.worker_id}: WARM START FROM CONSENSUS PARAMS FOR LAYER {l}.\n")
-
 
 class PoolManager:
     """
@@ -144,7 +143,6 @@ class PoolManager:
                 self.pool = None
             print("Closed multiprocessing pool.")
 
-
 class ADMM:
     """
     Top-level interface for training Pyomo-based NODEs with ADMM and multiprocessing.
@@ -163,7 +161,8 @@ class ADMM:
             use_pool=False,
             transcription_method='dc',
             residual_reg_param=None,
-            num_res_eval_nodes=None
+            num_res_eval_nodes=None,
+            obs_times=None
     ):
         self.Y_obs = Y_obs # ndarray (num_batches, batch_size, state_dim)
         self.num_batches, self.batch_size, self.state_dim = self.Y_obs.shape
@@ -182,6 +181,7 @@ class ADMM:
         self.transcription_method = transcription_method
         self.residual_reg_param = residual_reg_param
         self.num_res_eval_nodes = num_res_eval_nodes
+        self.obs_times = obs_times  # submodels interpolate Y_obs onto the collocation grid if not already 
 
         submodel_config = {
             'Y_obs': Y_obs,
@@ -196,6 +196,7 @@ class ADMM:
             'transcription_method': transcription_method,
             'residual_reg_param': residual_reg_param,
             'num_res_eval_nodes': num_res_eval_nodes,
+            'obs_times': obs_times
         }
 
         if use_pool:
@@ -291,7 +292,6 @@ class ADMM:
 
     #def compute_dual_residual(self):
 
-
     #----------------- WALL-CLOCK CONVERGENCE TRACKING -------------------
 
     def compute_prediction_mse(self,
@@ -322,10 +322,15 @@ class ADMM:
         return float(np.mean(per_batch_mse)), float(np.std(per_batch_mse))
 
 
-    #----------------- MAIN ADMM LOOP -------------------
+    #--------------------------- MAIN ADMM LOOP --------------------------------
 
     # I can make this simpler 
-    def run_admm_training(self, solver_options: dict, mse_eval_options: dict = None):
+    def run_admm_training(self,
+            solver_options: dict,
+            mse_eval_options: dict = None,
+            time_budget_min: float = None
+    ):
+        # RE-WRITE TO MATCH SEQUENTIAL TRAUNING LOOP STYLE (with wall-clock MSE tracking)
         near_primal_conv_tol = self.admm_primal_residual_tol * 0.5
         near_primal_conv_count = 0 
         near_mse_conv_tol = self.admm_train_mse_tol * 0.5
@@ -355,22 +360,27 @@ class ADMM:
                         "atol": mse_eval_options.get("atol", 1e-6),
                         "max_step": mse_eval_options.get("max_step", np.inf),
                     }
-                    train_mse, train_std = self.compute_prediction_mse(
+                    train_mse, train_mse_std = self.compute_prediction_mse(
                         mse_eval_options["Y_obs"], mse_eval_options["train_grid"], **pred_kw
                     )
-                    test_mse, test_std = self.compute_prediction_mse(
+                    test_mse, test_mse_std = self.compute_prediction_mse(
                         mse_eval_options["Y_test_obs"], mse_eval_options["test_grid"], **pred_kw
                     )
                     elapsed_min = (time.perf_counter() - t_start) / 60.0
                     self.mse_history["time_min"].append(elapsed_min)
                     self.mse_history["train_mse"].append(train_mse)
-                    self.mse_history["train_mse_std"].append(train_std)
+                    self.mse_history["train_mse_std"].append(train_mse_std)
                     self.mse_history["test_mse"].append(test_mse)
-                    self.mse_history["test_mse_std"].append(test_std)
+                    self.mse_history["test_mse_std"].append(test_mse_std)
                     print(f"Train MSE: {train_mse:.6e} | Test MSE: {test_mse:.6e}")
                     t_start += time.perf_counter() - t_eval0  # exclude eval cost from timer
 
-                # check ADMM convergence based on primal residual or train MSE or both 
+                # stop if the common wall-clock training budget is reached (training-only time)
+                if time_budget_min is not None and (time.perf_counter() - t_start) / 60.0 >= time_budget_min:
+                    print(f"ADMM stopped: {time_budget_min} min wall-clock budget reached at iter {self.iteration_count}.")
+                    break
+
+                # check ADMM convergence based on primal residual or train MSE or both
                 if self.admm_primal_residual_tol is not None: 
                     if r_primal <= self.admm_primal_residual_tol + near_primal_conv_tol:
                             near_primal_conv_count += 1

@@ -25,11 +25,6 @@ def main():
     # 'collocation' -> collocation NLP with theta* fixed (RK45 warm-start, IPOPT)
     inference_method = 'sequential'
 
-    # sequential (solver-in-the-loop) Neural ODE baseline settings (torchdiffeq)
-    # set run_sequential_baseline = False for a DC/IRR-DC-only comparison
-    run_sequential_baseline = True
-    seq_num_iterations = 30000
-
     # split train and test batch ids
     all_batch_ids = np.arange(0, 50)
     train_batch_ids = np.random.choice(all_batch_ids, size=10, replace=False).tolist()

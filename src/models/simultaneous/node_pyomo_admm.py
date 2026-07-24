@@ -3,6 +3,7 @@ import warnings
 import numpy as np 
 import time
 from scipy.integrate import solve_ivp
+from scipy.interpolate import CubicSpline
 import pyomo.environ as pyo
 from pyomo.opt import SolverStatus, TerminationCondition
 from src.models.simultaneous.direct_collocation import BarycentricInterpolation
@@ -23,9 +24,9 @@ class NODEPyomo:
             transcription_method='dc',
             residual_reg_param=None,
             num_res_eval_nodes=None, 
+            obs_times=None
     ):
-        self.Y_obs = Y_obs # observed state trajectory from measurements. ndarray (num_nodes, state_dim)
-        self.num_colloc_nodes, self.state_dim = self.Y_obs.shape
+        self.num_colloc_nodes, self.state_dim = Y_obs.shape
         if self.state_dim > self.num_colloc_nodes:
             warnings.warn("Y_obs should be structured such that each row represents a new collocation point.")
         self.end_time = end_time
@@ -36,9 +37,18 @@ class NODEPyomo:
             transcription_method=transcription_method,
             num_res_eval_nodes=num_res_eval_nodes
         )
-        self.colloc_grid = bary.colloc_grid
+        self.colloc_grid = bary.colloc_grid # (num_colloc_nodes,)
         self.bary_ws = bary.bary_ws
-        self.D_colloc = bary.D_colloc # ndarray (num_colloc_nodes, num_colloc_nodes)
+        self.D_colloc = bary.D_colloc # (num_colloc_nodes, num_colloc_nodes)
+
+        # align Y_obs to the collocation grid (if not already)
+        if obs_times is not None:
+            obs_times = np.asarray(obs_times)
+            if obs_times.shape[0] != self.num_colloc_nodes:
+                raise ValueError("obs_times length must match the number of Y_obs rows.")
+            self.Y_obs = CubicSpline(obs_times, self.Y_obs, axis=0)(self.colloc_grid).astype(self.Y_obs.dtype) # trade-off here?
+        else:
+            self.Y_obs = Y_obs
 
         self.layer_sizes = layer_sizes
         self.model = pyo.ConcreteModel()
@@ -375,7 +385,6 @@ class NODEPyomo:
         solver.options['max_iter'] = solver_options["max_iter"]
         solver.options['nlp_scaling_method'] = solver_options["nlp_scaling_method"]
         solver.options['mu_strategy'] = solver_options["mu_strategy"]
-        solver.options['print_level'] = solver_options["print_level"]
         solver.options['tol'] = solver_options["tol"] 
         solver.options['acceptable_tol'] = solver_options["acceptable_tol"]
         solver.options['acceptable_iter'] = solver_options["acceptable_iter"]
@@ -385,7 +394,7 @@ class NODEPyomo:
         # evaluation for a hard submodel, which can occur sporadically across the
         # multiprocessing pool) does NOT raise inside solve() and crash the whole run.
         # We load the solution manually only when the solver actually returned one.
-        result = solver.solve(self.model, tee=True, load_solutions=False)
+        result = solver.solve(self.model, tee=False, load_solutions=False)
         solve_wall_time = time.perf_counter() - t0
 
         solution_loaded = (

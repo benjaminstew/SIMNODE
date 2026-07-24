@@ -3,13 +3,13 @@ PyTorch implementation of a sequential Neural ODE
 training (solver-in-the-loop backpropagation) baseline.
 '''
 import math
-import time
 import numpy as np
 import torch
 from torch import nn
 from torch.optim import Adam
 from torchdiffeq import odeint
 from scipy.interpolate import CubicSpline
+
 
 class FeedForwardNN(nn.Module):
     """Feedforward MLP with tanh hidden layers and linear output layer."""
@@ -96,19 +96,19 @@ class NODESequential:
         return self.model(y0)
 
     def forward_solve(self,
-        y0: torch.Tensor,
         t_grid: torch.Tensor = None,
         rtol: float = None,
         atol: float = None,
         max_step: float = None
     ) -> torch.Tensor:
         """
-        Integrate the Neural ODE from y0 over self.t_grid and return Y (N, state_dim).
+        Integrate the Neural ODE from y0 over t_grid and return Y (N, state_dim).
 
         rtol/atol/max_step override the construction-time tolerances for this call when
         provided (e.g. tighter tolerances at inference); otherwise the instance defaults
         are used.
         """
+        y0 = self.Y_obs[0]
         if y0.dim() != 1:
             raise ValueError("y0 must be a 1D tensor.")
 
@@ -154,11 +154,15 @@ class NODESequential:
         expensive solver-in-the-loop phase.
         """
         n_pre = max(2, int(self.N * fraction))
-        t_pre = self.t_grid[:n_pre].detach().cpu().numpy() # (n_pre,)
-        Y_pre = self.Y_obs[:n_pre].detach().cpu().numpy() # (n_pre, state_dim)
-        spline = CubicSpline(t_pre, Y_pre, axis=0)
-        dY_pre = spline(t_pre, 1).astype(np.float32) # first derivative 
-        dY_target = torch.tensor(dY_pre, device=self.device, dtype=torch.float32)  # (n_pre, state_dim)
+        t_pre = self.t_grid[:n_pre] # (n_pre,)
+        Y_pre = self.Y_obs[:n_pre] # (n_pre, state_dim)
+
+        t_pre_np = t_pre.detach().cpu().numpy()
+        Y_pre_np = Y_pre.detach().cpu().numpy()
+        spline = CubicSpline(t_pre_np, Y_pre_np, axis=0)
+        dY_target_np = spline(t_pre_np, 1).astype(np.float32) # first derivative 
+
+        dY_target = torch.tensor(dY_target_np, device=self.device, dtype=torch.float32)  # (n_pre, state_dim)
 
         optimizer = Adam(self.model.parameters(), lr=learning_rate)
         loss_history: list[float] = []
@@ -228,10 +232,11 @@ class NODESequential:
         optimizer = Adam(self.model.parameters(), lr=learning_rate)
         train_loss_history: list[float] = []
 
+        y0 = self.Y_obs[0] 
         self.model.train()
         for iteration in range(num_iterations):
             optimizer.zero_grad()
-            Y = self.forward_solve()
+            Y = self.forward_solve(y0)
             loss_val = self.compute_loss(Y)
             loss_val.backward()
             optimizer.step()
@@ -253,8 +258,7 @@ class NODESequential:
         """
         Integrate the trained model from y0 over t_grid (eval mode, no grad).
 
-        Optional rtol/atol/max_step args override the construction-time tolerances, mirroring
-        the NODEPyomo.get_predicted_trajectory signature so callers can use both uniformly.
+        Optional rtol/atol/max_step args override the construction-time tolerances.
         """
         self.model.eval() # switch to eval mode 
         with torch.no_grad():
@@ -264,9 +268,6 @@ class NODESequential:
                 rtol=rtol, atol=atol, max_step=max_step
             )
         return Y
-
-
-#-------------------------------------- GLOBAL TRAINING FUNCTIONS --------------------------------------#
 
 def train_sequential_node(
     Y_obs: torch.Tensor,
@@ -283,7 +284,7 @@ def train_sequential_node(
     max_step: float = None,
     device: str = "cpu",
     verbose: bool = False,
-    log_every: int = 100,
+    log_every: int = 100
 ) -> tuple["NODESequential", dict[str, list[float]]]:
     """
     Build and train a sequential Neural ODE on a single trajectory.
@@ -299,7 +300,7 @@ def train_sequential_node(
         rtol=rtol,
         atol=atol,
         max_step=max_step,
-        device=device,
+        device=device
     )
     train_loss_history = model.train(
         num_iterations=num_iterations,
@@ -307,155 +308,8 @@ def train_sequential_node(
         pretrain_iterations=pretrain_iterations,
         pretrain_fraction=pretrain_fraction,
         verbose=verbose,
-        log_every=log_every,
+        log_every=log_every
     )
+
     return model, train_loss_history
 
-
-
-
-
-
-
-'''def train_sequential_multitraj(
-    Y_obs_train: torch.Tensor,
-    train_grid: torch.Tensor,
-    layer_sizes: list[int],
-    num_iterations: int,
-    Y_obs_test: torch.Tensor = None,
-    test_grid: torch.Tensor = None,
-    lambda_reg: float = 0.0,
-    learning_rate: float = 1e-3,
-    solver_method: str = "dopri5",
-    rtol: float = 1e-3,
-    atol: float = 1e-6,
-    max_step: float = None,
-    record_every: int = 10,
-    device: str = "cpu",
-    verbose: bool = False,
-    log_every: int = 50,
-):
-    """
-    Train ONE sequential Neural ODE jointly on multiple trajectories that share the
-    same dynamics (e.g. bioreactor batches with different initial conditions). This is
-    the solver-in-the-loop analogue of the ADMM consensus model, which couples all
-    batches into a single network -- so the two are directly comparable.
-
-    Each trajectory is integrated from its own initial condition over a shared time grid
-    (batched odeint); the loss is the summed per-trajectory MSE (Eq. 4) plus optional L2
-    regularisation. Train/test MSE are recorded versus wall-clock time using the same
-    per-batch-mean convention as ADMM.compute_prediction_mse, so the returned history
-    drops directly into the convergence plots.
-
-    Autonomous networks only (input = state); raise if layer_sizes is not state->state.
-
-    Parameters
-    ----------
-    Y_obs_train : ndarray (num_batches, num_nodes, state_dim)
-    train_grid  : ndarray (num_nodes,)
-    Y_obs_test, test_grid : optional held-out trajectories for the test-MSE history.
-    record_every : record train/test MSE every this many iterations.
-
-    Returns
-    -------
-    predict : callable(y0 (state_dim,), grid (M,)) -> ndarray (M, state_dim)
-        Forward-integrates the trained model in eval mode (for plotting).
-    mse_history : dict with keys time_min, train_mse, train_mse_std, test_mse,
-        test_mse_std (lists), matching ADMM.mse_history.
-    """
-    if Y_obs_train.ndim != 3:
-        raise ValueError("Y_obs_train must be 3D (num_batches, num_nodes, state_dim).")
-    state_dim = Y_obs_train.shape[2]
-    sizes = list(layer_sizes)
-    if sizes[0] != state_dim or sizes[-1] != state_dim:
-        raise ValueError(
-            "train_sequential_multitraj supports autonomous networks only "
-            f"(layer_sizes must map {state_dim} -> {state_dim})."
-        )
-
-    dev = torch.device(device or "cpu")
-    model = FeedForwardNN(sizes).to(dev)
-
-    t_train = torch.tensor(train_grid, dtype=torch.float32, device=dev)
-    Y_train = torch.tensor(Y_obs_train, dtype=torch.float32, device=dev)   # (B, N, D)
-    y0_train = Y_train[:, 0, :]                                            # (B, D)
-    Y_train_NBD = Y_train.permute(1, 0, 2)                                 # (N, B, D)
-
-    has_test = Y_obs_test is not None and test_grid is not None
-    if has_test:
-        t_test = torch.tensor(test_grid, dtype=torch.float32, device=dev)
-        Y_test = torch.tensor(Y_obs_test, dtype=torch.float32, device=dev)  # (B, N, D)
-        y0_test = Y_test[:, 0, :]
-
-    options = None if max_step is None else {"max_step": float(max_step)}
-
-    def rhs(t, y):                       # autonomous: f_theta(y)
-        return model(y)
-
-    def rollout(y0_batch, t_eval):
-        return odeint(rhs, y0_batch, t_eval, method=solver_method,
-                      rtol=rtol, atol=atol, options=options)               # (M, B, D)
-
-    def per_batch_mse(y0_batch, t_eval, Y_ref_BND):
-        # mean/std across batches of mean((pred - obs)^2), matching ADMM convention
-        with torch.no_grad():
-            pred = rollout(y0_batch, t_eval).permute(1, 0, 2)              # (B, M, D)
-        mse_b = (pred - Y_ref_BND).pow(2).mean(dim=(1, 2)).cpu().numpy()   # (B,)
-        return float(np.mean(mse_b)), float(np.std(mse_b))
-
-    mse_history = {"time_min": [], "train_mse": [], "train_mse_std": [],
-                   "test_mse": [], "test_mse_std": []}
-    optimizer = Adam(model.parameters(), lr=learning_rate)
-    t_start = time.perf_counter()
-
-    def record():
-        elapsed_min = (time.perf_counter() - t_start) / 60.0
-        model.eval()
-        try:
-            tr_m, tr_s = per_batch_mse(y0_train, t_train, Y_train)
-        except (RuntimeError, AssertionError):
-            tr_m, tr_s = np.nan, np.nan   # unstable field early in training => skip point
-        if has_test:
-            try:
-                te_m, te_s = per_batch_mse(y0_test, t_test, Y_test)
-            except (RuntimeError, AssertionError):
-                te_m, te_s = np.nan, np.nan
-        else:
-            te_m, te_s = np.nan, np.nan
-        model.train()
-        mse_history["time_min"].append(elapsed_min)
-        mse_history["train_mse"].append(tr_m)
-        mse_history["train_mse_std"].append(tr_s)
-        mse_history["test_mse"].append(te_m)
-        mse_history["test_mse_std"].append(te_s)
-
-    N = t_train.shape[0]
-    model.train()
-    record()  # initial (pre-training) point
-    for it in range(num_iterations):
-        optimizer.zero_grad()
-        Y_hat = rollout(y0_train, t_train)                                 # (N, B, D)
-        loss_val = (Y_hat - Y_train_NBD).pow(2).sum() / float(N)
-        if lambda_reg > 0.0:
-            loss_val = loss_val + lambda_reg * sum(p.pow(2).sum() for p in model.parameters())
-        loss_val.backward()
-        optimizer.step()
-
-        if (it + 1) % max(1, record_every) == 0:
-            record()
-        if verbose and (it + 1) % max(1, log_every) == 0:
-            print(f"[seq] iter {it + 1}/{num_iterations}: loss={float(loss_val.detach().cpu()):.6e}")
-
-    if num_iterations % max(1, record_every) != 0:
-        record()  # ensure the final state is recorded
-
-    def predict(y0, grid):
-        model.eval()
-        y0_t = torch.tensor(np.asarray(y0, dtype=np.float32).reshape(-1), device=dev)
-        grid_t = torch.tensor(np.asarray(grid, dtype=np.float32), device=dev)
-        with torch.no_grad():
-            pred = odeint(rhs, y0_t, grid_t, method=solver_method,
-                          rtol=rtol, atol=atol, options=options)
-        return pred.cpu().numpy()        # (M, state_dim)
-
-    return predict, mse_history'''
