@@ -30,7 +30,7 @@ def main():
 
     layer_sizes = [state_dim, 32, state_dim]   # same NN for both models
     L2_REG = 1e-4                                  # same L2 for both models
-    TIME_BUDGET_MIN = 30.0                         # common wall-clock training budget
+    TIME_BUDGET_MIN = 5.0                         # sequential wall-clock training budget
 
     # torch multi-trajectory (sequential mini-batch Adam) settings
     MINI_BATCH_SIZE = 10
@@ -46,7 +46,7 @@ def main():
     EVAL_RTOL = 1e-3
     EVAL_ATOL = 1e-6
 
-    NUM_TRAIN = 10
+    NUM_TRAIN = 45
     NUM_TEST = 5
     SEED = 0
 
@@ -119,7 +119,7 @@ def main():
         eval_atol=EVAL_ATOL,
         seed=SEED,
         verbose=True,
-        log_every=100
+        log_every=1000
     )
     train_runtimes['torch'] = time.perf_counter() - t0
     print(f"torch training time: {train_runtimes['torch']:.1f}s")
@@ -168,8 +168,8 @@ def main():
         use_pool=True,
         transcription_method='dc',
         max_admm_iterations=MAX_ADMM_ITERATIONS,
-        admm_primal_residual_tol=3,
-        admm_train_mse_tol=1,
+        admm_primal_residual_tol=1,
+        admm_train_mse_tol=0.5,
         obs_times=train_grid
     )
 
@@ -179,7 +179,7 @@ def main():
     admm = ADMM(**dc_config)
     t0 = time.perf_counter()
     admm.run_admm_training(
-        ipopt_options, mse_eval_options=mse_eval_options, time_budget_min=TIME_BUDGET_MIN
+        ipopt_options, mse_eval_options=mse_eval_options
     )
     train_runtimes['admm'] = time.perf_counter() - t0
     print(f"ADMM training time: {train_runtimes['admm']:.1f}s")

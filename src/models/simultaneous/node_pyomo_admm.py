@@ -46,7 +46,7 @@ class NODEPyomo:
             obs_times = np.asarray(obs_times)
             if obs_times.shape[0] != self.num_colloc_nodes:
                 raise ValueError("obs_times length must match the number of Y_obs rows.")
-            self.Y_obs = CubicSpline(obs_times, self.Y_obs, axis=0)(self.colloc_grid).astype(self.Y_obs.dtype) # trade-off here?
+            self.Y_obs = CubicSpline(obs_times, Y_obs, axis=0)(self.colloc_grid).astype(Y_obs.dtype) # trade-off here?
         else:
             self.Y_obs = Y_obs
 
