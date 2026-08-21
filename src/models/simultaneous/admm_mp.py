@@ -1,10 +1,13 @@
-'''multiprocessing wrapper to organize NODEPyomo submodels for ADMM-based batched training.'''
+'''
+multiprocessing wrapper to organize NODEPyomo submodels for ADMM-based batched training.
+'''
 from src.models.simultaneous.node_pyomo_admm import NODEPyomo
 import numpy as np
 import time
 import threading
 import multiprocessing as mp
 from scipy.integrate import solve_ivp
+
 
 # ---- MODULE LEVEL FUNCTIONS (required for mp.Pool pickling) ----
 WORKER = None   # child processes (independent memory) each have own WORKER instance
@@ -37,9 +40,10 @@ def solve_worker(payload: dict):
             except threading.BrokenBarrierError:
                 pass
 
+
 class MPWorker:
     '''
-    Wraps a NODEPyomo submodel and handles all Pyomo <-> numpy parameter communication.
+    Wraps a NODEPyomo submodel and handles all Pyomo subproblem <-> numpy ADMM communication.
     Used directly in the main process for sequential mode, or inside worker processes for
     parallel mode.
     '''
@@ -58,12 +62,18 @@ class MPWorker:
             admm_submodel=True,
             admm_penalty_param=submodel_config['admm_penalty_param'],
             transcription_method=submodel_config['transcription_method'],
-            residual_reg_param=submodel_config['residual_reg_param'],
+            irrdc_param=submodel_config['irrdc_param'],
             num_res_eval_nodes=submodel_config['num_res_eval_nodes'],
             obs_times=submodel_config['obs_times'],
         )
         self.submodel_Ws = [0 for _ in range(len(self.layer_sizes) - 1)]
-        self.submodel_bs = [0 for _ in range(len(self.layer_sizes) - 1)]
+        self.submodel_bs = [0 for _ in range(len(self.layer_sizes) - 1)] 
+        # set to Xavier init ws/zero init bs
+        for l in range(1, len(self.layer_sizes)):
+            dict_Ws = self.submodel.model.Ws[l].W.extract_values()
+            dict_bs = self.submodel.model.bs[l].b.extract_values()
+            self.submodel_Ws[l-1] = self.dict_to_ndarray(dict_Ws, (self.layer_sizes[l-1], self.layer_sizes[l]))
+            self.submodel_bs[l-1] = self.dict_to_ndarray(dict_bs, (1, self.layer_sizes[l]))
 
     def dict_to_ndarray(self, d: dict, shape: tuple):
         arr = np.zeros(shape, dtype=float)
@@ -96,10 +106,11 @@ class MPWorker:
             self.submodel.model.dual_var_bs[l].b.store_values(self.ndarray_to_dict(dual_var_bs[l-1]))
 
             # warm start submodel from consensus params (to help convergence)
-            if iteration_count > 1: 
+            if iteration_count > 10: 
                 self.submodel.model.Ws[l].W.set_values(self.ndarray_to_dict(consensus_Ws[l-1]))
                 self.submodel.model.bs[l].b.set_values(self.ndarray_to_dict(consensus_bs[l-1]))
                 #print(f"\nWORKER {self.worker_id}: WARM START FROM CONSENSUS PARAMS FOR LAYER {l}.\n")
+
 
 class PoolManager:
     """
@@ -143,26 +154,26 @@ class PoolManager:
                 self.pool = None
             print("Closed multiprocessing pool.")
 
+
 class ADMM:
     """
-    Top-level interface for training Pyomo-based NODEs with ADMM and multiprocessing.
+    Main interface between ADMM consensus problem and Pyomo subproblems.
     Owns the consensus parameters, dual variables, and all ADMM algorithm logic.
     Set use_pool=False (default) to run sequentially for testing.
     """
     def __init__(self,
-            Y_obs, layer_sizes, end_time,
-            state_lower_bound, state_upper_bound,
-            param_lower_bound, param_upper_bound,
-            l2_reg_param,
-            admm_penalty_param,
-            max_admm_iterations,
-            admm_primal_residual_tol=None,
-            admm_train_mse_tol=None, 
-            use_pool=False,
-            transcription_method='dc',
-            residual_reg_param=None,
-            num_res_eval_nodes=None,
-            obs_times=None
+            Y_obs: np.ndarray, 
+            layer_sizes: list, 
+            end_time: float,
+            state_lower_bound: float, state_upper_bound: float,
+            param_lower_bound: float, param_upper_bound: float,
+            l2_reg_param: float,
+            admm_penalty_param: float,
+            use_pool: bool = False,
+            transcription_method: str = 'dc',
+            irrdc_param: float = None,
+            num_res_eval_nodes: int = None,
+            obs_times: np.ndarray = None
     ):
         self.Y_obs = Y_obs # ndarray (num_batches, batch_size, state_dim)
         self.num_batches, self.batch_size, self.state_dim = self.Y_obs.shape
@@ -174,12 +185,9 @@ class ADMM:
         self.param_upper_bound = param_upper_bound
         self.l2_reg_param = l2_reg_param
         self.admm_penalty_param = admm_penalty_param
-        self.max_admm_iterations = max_admm_iterations
-        self.admm_primal_residual_tol = admm_primal_residual_tol
-        self.admm_train_mse_tol = admm_train_mse_tol
         self.use_pool = use_pool
         self.transcription_method = transcription_method
-        self.residual_reg_param = residual_reg_param
+        self.irrdc_param = irrdc_param
         self.num_res_eval_nodes = num_res_eval_nodes
         self.obs_times = obs_times  # submodels interpolate Y_obs onto the collocation grid if not already 
 
@@ -194,7 +202,7 @@ class ADMM:
             'l2_reg_param': l2_reg_param,
             'admm_penalty_param': admm_penalty_param,
             'transcription_method': transcription_method,
-            'residual_reg_param': residual_reg_param,
+            'irrdc_param': irrdc_param,
             'num_res_eval_nodes': num_res_eval_nodes,
             'obs_times': obs_times
         }
@@ -206,11 +214,11 @@ class ADMM:
             self.workers = [MPWorker(i, submodel_config) for i in range(self.num_batches)] 
             self.pool_manager = None
 
-        self.dual_var_Ws, self.dual_var_bs = self.zero_initialise_dual_vars()
+        self.dual_var_Ws, self.dual_var_bs = self.zero_init_dual_vars()
+        # consensus params are warm-initialised at the start of run_admm_training (needs solver options)
+        self.consensus_Ws, self.consensus_bs = None, None
         self.submodels_Ws = [[0 for _ in range(len(layer_sizes) - 1)] for _ in range(self.num_batches)]
         self.submodels_bs = [[0 for _ in range(len(layer_sizes) - 1)] for _ in range(self.num_batches)]
-        self.consensus_Ws = [np.zeros((layer_sizes[l], layer_sizes[l+1])) for l in range(len(layer_sizes) - 1)]
-        self.consensus_bs = [np.zeros((1, layer_sizes[l+1])) for l in range(len(layer_sizes) - 1)]
         self.iteration_count = 0
 
         self.mse_history = {
@@ -219,7 +227,32 @@ class ADMM:
             "test_mse": [], "test_mse_std": [],
         }
 
-    def zero_initialise_dual_vars(self):
+    def warm_init_consensus_params(self, solver_options: dict):
+        '''Warm-initialise the consensus parameters from a single (unpenalised) submodel solve.'''
+        warmup_model = NODEPyomo(
+            Y_obs=self.Y_obs[0],
+            layer_sizes=self.layer_sizes,
+            end_time=self.end_time,
+            state_lower_bound=self.state_lower_bound, state_upper_bound=self.state_upper_bound,
+            param_lower_bound=self.param_lower_bound, param_upper_bound=self.param_upper_bound,
+            l2_reg_param=self.l2_reg_param,
+            admm_submodel=False, # no consensus penalty term => params not forced towards zero  
+            transcription_method=self.transcription_method,
+            irrdc_param=self.irrdc_param,  
+            num_res_eval_nodes=self.num_res_eval_nodes,
+            obs_times=self.obs_times
+        )
+        warmup_model.solve_model(solver_options)
+        init_consensus_Ws = [warmup_model.pyomo_var_to_numpy(
+                                warmup_model.model.Ws[l].W, (self.layer_sizes[l-1], self.layer_sizes[l])
+                            ) for l in warmup_model.model.l]
+        init_consensus_bs = [warmup_model.pyomo_var_to_numpy(
+                                warmup_model.model.bs[l].b, (1, self.layer_sizes[l])
+                            )for l in warmup_model.model.l]
+
+        return init_consensus_Ws, init_consensus_bs
+
+    def zero_init_dual_vars(self):
         dual_var_Ws = [
             [np.zeros((self.layer_sizes[l], self.layer_sizes[l+1])) for l in range(len(self.layer_sizes) - 1)]
             for _ in range(self.num_batches)
@@ -237,7 +270,8 @@ class ADMM:
         for i in range(self.num_batches):
             self.workers[i].broadcast_consensus_and_duals(
                 self.consensus_Ws, self.consensus_bs,
-                self.dual_var_Ws[i], self.dual_var_bs[i]
+                self.dual_var_Ws[i], self.dual_var_bs[i], 
+                self.iteration_count
             )
             self.workers[i].solve_submodel(solver_options)
             self.submodels_Ws[i] = self.workers[i].submodel_Ws
@@ -262,6 +296,9 @@ class ADMM:
 
     def update_consensus_params(self):
         '''Update consensus params by averaging submodel params.'''
+        old_consensus_Ws = [w.copy() for w in self.consensus_Ws]
+        old_consensus_bs = [b.copy() for b in self.consensus_bs]
+
         self.consensus_Ws = [w.copy() for w in self.submodels_Ws[0]]
         self.consensus_bs = [b.copy() for b in self.submodels_bs[0]]
         for i in range(1, self.num_batches):
@@ -272,7 +309,10 @@ class ADMM:
             self.consensus_Ws[l] /= self.num_batches
             self.consensus_bs[l] /= self.num_batches
 
+        return old_consensus_Ws, old_consensus_bs
+
     def update_dual_vars(self):
+        '''Update dual variables for each subproblem. Call after update_consensus_params.'''
         for i in range(self.num_batches):
             for l in range(len(self.layer_sizes) - 1):
                 self.dual_var_Ws[i][l] += (
@@ -283,14 +323,22 @@ class ADMM:
                 )
 
     def compute_primal_residual(self):
-        r_primal = 0
+        '''Average over subproblem L2 norm primal residuals'''
+        r_primal = np.zeros(self.num_batches) # store per-subproblem primal residuals 
         for i in range(self.num_batches):
             for l in range(len(self.layer_sizes) - 1):
-                r_primal += np.linalg.norm(self.submodels_Ws[i][l] - self.consensus_Ws[l])
-                r_primal += np.linalg.norm(self.submodels_bs[i][l] - self.consensus_bs[l])
-        return r_primal
+                r_primal[i] += np.linalg.norm(self.submodels_Ws[i][l] - self.consensus_Ws[l])
+                r_primal[i] += np.linalg.norm(self.submodels_bs[i][l] - self.consensus_bs[l])
+        return 1/self.num_batches * np.sum(r_primal)
 
-    #def compute_dual_residual(self):
+    def compute_dual_residual(self, old_consensus_Ws, old_consensus_bs):
+        '''Average over subproblem L2 norm dual residuals'''
+        s_dual = 0
+        for l in range(len(self.layer_sizes) - 1):
+            s_dual += np.linalg.norm(self.consensus_Ws[l] - old_consensus_Ws[l])
+            s_dual += np.linalg.norm(self.consensus_bs[l] - old_consensus_bs[l])
+        return self.admm_penalty_param * s_dual
+
 
     #----------------- WALL-CLOCK CONVERGENCE TRACKING -------------------
 
@@ -320,35 +368,55 @@ class ADMM:
             return np.nan, np.nan
         
         return float(np.mean(per_batch_mse)), float(np.std(per_batch_mse))
-
+    
 
     #--------------------------- MAIN ADMM LOOP --------------------------------
 
-    # I can make this simpler 
+    def set_solver_options(self, early_solver_options: dict, late_solver_options: dict, num_early_iterations: int):
+        '''IPOPT options for the current ADMM iteration: the soft `early_solver_options` for the
+        first `num_early_iterations` iterations, then the standard `late_solver_options`.'''
+        if self.iteration_count < num_early_iterations:
+            return early_solver_options
+        return late_solver_options
+
     def run_admm_training(self,
-            solver_options: dict,
-            mse_eval_options: dict = None,
-            time_budget_min: float = None
+            early_solver_options: dict,
+            late_solver_options: dict,
+            admm_primal_res_tol: float,
+            admm_dual_res_tol: float,
+            max_admm_iterations: int,
+            num_early_iterations: int = 10,
+            training_clock_budget: float = None,
+            mse_eval_options: dict = None
     ):
-        # RE-WRITE TO MATCH SEQUENTIAL TRAUNING LOOP STYLE (with wall-clock MSE tracking)
-        near_primal_conv_tol = self.admm_primal_residual_tol * 0.5
-        near_primal_conv_count = 0 
-        near_mse_conv_tol = self.admm_train_mse_tol * 0.5
-        near_mse_convergence_count = 0
+        '''Run the ADMM consensus training loop.'''
+        # warm-initialise the consensus params (single unpenalised submodel solve)
+        self.consensus_Ws, self.consensus_bs = self.warm_init_consensus_params(late_solver_options)
+
+        # "near" convergence band: accept convergence if BOTH residuals stay within
+        # (tol + near_tol) = 1.1 * tol for a number of CONSECUTIVE iterations.
+        near_primal_tol = admm_primal_res_tol * 0.1
+        near_dual_tol = admm_dual_res_tol * 0.1
+        near_conv_count = 0  # consecutive iterations with both residuals inside the loose band
 
         t_start = time.perf_counter()
         try:
-            for iteration in range(self.max_admm_iterations):
+            for iteration in range(max_admm_iterations):
                 print(f"ADMM iteration {iteration + 1}")
+                solver_options = self.set_solver_options(
+                    early_solver_options, late_solver_options, num_early_iterations
+                )
                 if self.use_pool:
                     self.solve_submodels_parallel(solver_options)
                 else:
                     self.solve_submodels_sequential(solver_options)
-                self.update_consensus_params()
+                old_consensus_Ws, old_consensus_bs = self.update_consensus_params()
                 self.update_dual_vars()
                 r_primal = self.compute_primal_residual()
+                s_dual = self.compute_dual_residual(old_consensus_Ws, old_consensus_bs)
                 self.iteration_count += 1
                 print(f"Primal residual: {r_primal:.6f}")
+                print(f"Dual residual: {s_dual:.6f}")
 
                 # Record wall-clock convergence (prediction MSE) using the current consensus model
                 # Timer is paused for evaluation
@@ -375,37 +443,28 @@ class ADMM:
                     print(f"Train MSE: {train_mse:.6e} | Test MSE: {test_mse:.6e}")
                     t_start += time.perf_counter() - t_eval0  # exclude eval cost from timer
 
-                # stop if the common wall-clock training budget is reached (training-only time)
-                if time_budget_min is not None and (time.perf_counter() - t_start) / 60.0 >= time_budget_min:
-                    print(f"ADMM stopped: {time_budget_min} min wall-clock budget reached at iter {self.iteration_count}.")
+                # ADMM has converged only when BOTH the primal and dual residuals are small.
+                if r_primal <= admm_primal_res_tol and s_dual <= admm_dual_res_tol:
+                    print(f"ADMM converged (primal & dual residuals) after {self.iteration_count} iterations!")
                     break
 
-                # check ADMM convergence based on primal residual or train MSE or both
-                if self.admm_primal_residual_tol is not None: 
-                    if r_primal <= self.admm_primal_residual_tol + near_primal_conv_tol:
-                            near_primal_conv_count += 1
-                    if self.admm_train_mse_tol is not None:
-                        if train_mse <= self.admm_train_mse_tol + near_mse_conv_tol:
-                            near_mse_convergence_count += 1
-                        if (r_primal <= self.admm_primal_residual_tol or near_primal_conv_count >= 5) and (train_mse <= self.admm_train_mse_tol or near_mse_convergence_count >= 5):
-                            print(f"ADMM converged (wrt primal residual and train MSE) after {self.iteration_count} iterations!")
-                            break        
-                    elif r_primal <= self.admm_primal_residual_tol or near_primal_conv_count >= 5:
-                        print(f"ADMM converged (wrt primal residual)after {self.iteration_count} iterations!")
-                        break
-                
-                elif self.admm_train_mse_tol is not None:
-                    if train_mse <= self.admm_train_mse_tol + near_mse_conv_tol:
-                            near_mse_convergence_count += 1
-                    if train_mse <= self.admm_train_mse_tol or near_mse_convergence_count >= 5:
-                        print(f"ADMM converged (wrt train MSE) after {self.iteration_count} iterations!")
-                        break         
-                
+                # accept once BOTH residuals sit within the loose band for 5
+                # CONSECUTIVE iterations (reset the counter as soon as either leaves the band).
+                if (r_primal <= admm_primal_res_tol + near_primal_tol and s_dual <= admm_dual_res_tol + near_dual_tol):
+                    near_conv_count += 1
                 else:
-                    raise ValueError("NO ADMM CONVERGENCE CRITERIA SPECIFIED.")
+                    near_conv_count = 0
+                if near_conv_count >= 5:
+                    print(f"ADMM converged (both residuals within near-tol for {near_conv_count} "
+                          f"consecutive iters) after {self.iteration_count} iterations!")
+                    break
 
-            if self.iteration_count >= self.max_admm_iterations:
-                print("Max ADMM iterations reached.")
+                # stop if the wall-clock training budget is reached (training-only time)
+                if training_clock_budget is not None and (time.perf_counter() - t_start) / 60.0 >= training_clock_budget:
+                    print(f"ADMM stopped: {training_clock_budget} min wall-clock budget reached at iter {self.iteration_count}.")
+                    break
+
+                # max_admm_iterations is enforced by the enclosing for-loop range()
         
         finally:
             if self.use_pool:
@@ -429,9 +488,7 @@ class ADMM:
             atol: float = 1e-6,
             max_step: float = np.inf
     ):
-        '''
-        Predict state trajectory over t_grid via forward integration of the consenus model.
-        '''
+        '''Predict state trajectory over t_grid via forward integration of the consenus model.'''
         predicted_trajectory = solve_ivp(
             fun=self.nn_prediction,
             t_span=(t_grid[0], t_grid[-1]),

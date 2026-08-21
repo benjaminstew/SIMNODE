@@ -1,34 +1,42 @@
-# currently lacks customisation on the numerical analysis methods used, interpolation scheme used, ML architecture used, param initialisation methods, etc...
 import warnings
 import numpy as np 
 import time
-from scipy.integrate import solve_ivp
+from pathlib import Path
 from scipy.interpolate import CubicSpline
 import pyomo.environ as pyo
 from pyomo.opt import SolverStatus, TerminationCondition
+from pyomo.common.errors import ApplicationError
+
 from src.models.simultaneous.direct_collocation import BarycentricInterpolation
 
 class NODEPyomo:
     """
     Implementation of a base Pyomo model to train collocation-based Neural ODEs using the IPOPT solver. 
     Additional methods for ADMM-based batched training are implemented.
-    I have tried to make the code as scalable as possible with NN size etc., but there are still may improvements to be made.
     """
     def __init__(self, 
-            Y_obs, layer_sizes, end_time, 
-            state_lower_bound, state_upper_bound, 
-            param_lower_bound, param_upper_bound,
-            l2_reg_param, 
-            admm_submodel=False, 
-            admm_penalty_param=None,
-            transcription_method='dc',
-            residual_reg_param=None,
-            num_res_eval_nodes=None, 
-            obs_times=None
+            Y_obs: np.ndarray, 
+            layer_sizes: list, 
+            end_time: float,
+            state_lower_bound: float, state_upper_bound: float,
+            param_lower_bound: float, param_upper_bound: float,
+            l2_reg_param: float,
+            admm_submodel: bool = False,
+            admm_penalty_param: float = None,
+            transcription_method: str = 'dc',
+            irrdc_param: float = None,
+            num_res_eval_nodes: int = None,
+            obs_times: np.ndarray = None
     ):
         self.num_colloc_nodes, self.state_dim = Y_obs.shape
+        if Y_obs.ndim != 2:
+            raise ValueError(
+                f"Y_obs must be 2D (num_colloc_nodes, state_dim); got {Y_obs.shape}."
+            )
         if self.state_dim > self.num_colloc_nodes:
-            warnings.warn("Y_obs should be structured such that each row represents a new collocation point.")
+            warnings.warn(
+                f"Y_obs should be structured such that each row represents a new collocation point."
+            )
         self.end_time = end_time
 
         bary = BarycentricInterpolation(
@@ -60,17 +68,17 @@ class NODEPyomo:
         
         self.transcription_method = transcription_method
         if self.transcription_method == 'irrdc': 
-            if residual_reg_param is None or num_res_eval_nodes is None:
-                raise ValueError("Need to set hyperparameter residual_reg_param and num_res_eval_nodes for IRRDC method.")
+            if irrdc_param is None or num_res_eval_nodes is None:
+                raise ValueError("Need to set hyperparameter irrdc_param and num_res_eval_nodes for irrdc method.")
             self.num_res_eval_nodes = num_res_eval_nodes
             self.res_eval_grid = bary.res_eval_grid
             self.L_res = bary.L_res
             self.D_res = bary.D_res
-            self.rho_reg = residual_reg_param # regularisation hyperparameter for residual penalty term 
+            self.irrdc_param = irrdc_param # regularisation hyperparameter for residual penalty term 
             self.quadrature_ws = bary.quadrature_ws # quadrature weights for residual penalty term
 
         self.admm_submodel = admm_submodel
-        if admm_submodel:
+        if self.admm_submodel:
             if admm_penalty_param is None:
                 raise ValueError("Must set penalty hyperparameter admm_penalty_param for ADMM submodel.")  
             self.nu_reg = admm_penalty_param # ADMM penalty parameter for consensus penalty term 
@@ -163,7 +171,7 @@ class NODEPyomo:
         reg_mse = self.dc_objective_rule(model) 
 
         # Residual penalty term: (1 / (2 * rho)) * sum_n(w_m * ||interpolant_m||_2^2) 
-        residual_penalty = (1 / (2 * self.rho_reg)) * sum(
+        residual_penalty = (1 / (2 * self.irrdc_param)) * sum(
             self.quadrature_ws[m-1] * (model.ode_lhs_res[m, d] - nn_output_res[m-1, d-1])**2
             for m in model.m
             for d in model.d
@@ -172,7 +180,7 @@ class NODEPyomo:
         return reg_mse + residual_penalty
 
     def build_model(self):
-  
+
         # ------------ SETS ------------
         self.model.l = pyo.RangeSet(len(self.layer_sizes) - 1) # [1:len(self.layer_sizes)-1] as for n layers, have n-1 W matrices/b vectors
         self.model.n = pyo.RangeSet(self.num_colloc_nodes) 
@@ -368,66 +376,73 @@ class NODEPyomo:
             self.model.Ws[l].W.fix()
             self.model.bs[l].b.fix()
 
-    def solve_model(self, solver_options):
-        '''
-        Solve the Pyomo model using the IPOPT solver.
-        
-        Args:
-            solver_options: dictionary of solver options specific to the transcription method used.
-        '''
+    def solve_model(self, solver_options: dict):
+        '''Solve the Pyomo model using the IPOPT solver.'''
         # set up IPOPT solver
         #solver = pyo.SolverFactory("ipopt", executable="/rds/general/user/bms125/home/miniforge3/envs/cnode/bin/ipopt") # HPC
-        #solver = pyo.SolverFactory("ipopt", executable="/usr/local/bin/ipopt")
-        solver = pyo.SolverFactory("ipopt", executable="/opt/homebrew/bin/ipopt") 
+        solver = pyo.SolverFactory("ipopt", executable="/usr/local/bin/ipopt")
+        #solver = pyo.SolverFactory("ipopt", executable="/opt/homebrew/bin/ipopt") 
         #print("Solver available?: {}".format(solver.available())) 
         
-        # set global solver options
+        # Numeric run limits (not in the option file) come from solver_options; all other IPOPT
+        # settings (linear_solver, nlp scaling, mu_strategy, print_level, HSL lib, ...) are read
+        # from the option file in the repo root (CNODE/ipopt.opt).
         solver.options['max_iter'] = solver_options["max_iter"]
-        solver.options['nlp_scaling_method'] = solver_options["nlp_scaling_method"]
-        solver.options['mu_strategy'] = solver_options["mu_strategy"]
-        solver.options['tol'] = solver_options["tol"] 
+        solver.options['tol'] = solver_options["tol"]
         solver.options['acceptable_tol'] = solver_options["acceptable_tol"]
         solver.options['acceptable_iter'] = solver_options["acceptable_iter"]
+        repo_root = Path(__file__).resolve().parents[3]  # .../CNODE
+        option_path = repo_root / "ipopt.opt"
+        if not option_path.exists():
+            raise FileNotFoundError(f"IPOPT option file not found at {option_path}")
+        solver.options["option_file_name"] = str(option_path)
 
         t0 = time.perf_counter()
-        # load_solutions=False so an IPOPT 'error' exit (e.g. NaN in a function
-        # evaluation for a hard submodel, which can occur sporadically across the
-        # multiprocessing pool) does NOT raise inside solve() and crash the whole run.
-        # We load the solution manually only when the solver actually returned one.
-        result = solver.solve(self.model, tee=False, load_solutions=False)
+        # load_solutions=True lets Pyomo load the solution straight into the model on success.
+        # Wrapped in try/except so a genuinely failed solve (no solution returned) keeps the
+        # submodel's warm-start params instead of raising and crashing the multiprocessing pool.
+        # NOTE: with load_solutions=True Pyomo EMPTIES result.solution after loading, so success
+        # must be judged from the solver status / termination condition, NOT len(result.solution).
+        result = None
+        try:
+            result = solver.solve(self.model, tee=False, load_solutions=True)
+            tc = result.solver.termination_condition
+            solution_loaded = (
+                result.solver.status in (SolverStatus.ok, SolverStatus.warning)
+                and tc in (
+                    TerminationCondition.optimal,
+                    TerminationCondition.locallyOptimal,
+                    TerminationCondition.feasible,
+                    TerminationCondition.maxIterations,
+                )
+            )
+        except (ApplicationError, ValueError) as exc:
+            solution_loaded = False
+            print(f"Submodel solve raised {type(exc).__name__}: {exc}; keeping warm-start params.")
         solve_wall_time = time.perf_counter() - t0
 
-        solution_loaded = (
-            len(result.solution) > 0
-            and result.solver.status in (SolverStatus.ok, SolverStatus.warning)
-        )
-        if solution_loaded:
-            self.model.solutions.load_from(result)
-
-        iterations = getattr(result.solver, "iterations", None)
+        status = str(result.solver.status) if result is not None else "error"
+        termination = str(result.solver.termination_condition) if result is not None else "solve_raised"
+        iterations = getattr(result.solver, "iterations", None) if result is not None else None
         self.last_solve_info = {
-            "status": str(result.solver.status),
-            "termination_condition": str(result.solver.termination_condition),
+            "status": status,
+            "termination_condition": termination,
             "iterations": int(iterations) if iterations is not None else None,
             "solve_wall_time_s": solve_wall_time,
             "solution_loaded": solution_loaded,
         }
 
-        if solution_loaded and result.solver.termination_condition == TerminationCondition.optimal:
+        if solution_loaded:
             if not self.admm_submodel:
                 self.freeze_vars()
-                print("\nSolve time {:.1f}s for {} iterations\n".format(solve_wall_time, iterations))
-                #print("NN parameters have been frozen")
-            #print("Solution is feasible and optimal\n\n")
-        elif not solution_loaded:
+                print("\nSolve time {:.1f}s for {} iterations (termination={})\n".format(
+                    solve_wall_time, iterations, termination))
+        else:
             # No usable solution: the submodel keeps its warm-start (consensus) params
             # for this ADMM iteration rather than aborting the run.
             print("Submodel solve returned no usable solution "
                   "(status={}, termination={}); keeping warm-start params for this batch.".format(
-                      result.solver.status, result.solver.termination_condition))
-        else:
-            print("Solution loaded but not optimal (termination={}); using last iterate.".format(
-                result.solver.termination_condition))
+                      status, termination))
 
     
     # ------------------------------ DIAGNOSTIC & MISC METHODS ------------------------------- #

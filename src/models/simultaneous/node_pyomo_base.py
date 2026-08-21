@@ -1,5 +1,9 @@
-# currently lacks customisation on the numerical analysis methods used, interpolation scheme used, param initialisation methods, etc...
-from pyexpat import model
+'''
+currently lacks customisation on:
+- the numerical analysis methods used, 
+- interpolation scheme used, 
+- param initialisation methods, etc...
+'''
 import warnings
 import numpy as np 
 import time
@@ -11,18 +15,20 @@ from src.models.simultaneous.direct_collocation import BarycentricInterpolation
 
 class NODEPyomo:
     """
-    Implementation of a base Pyomo model to train collocation-based Neural ODEs using the IPOPT solver. 
-    I have tried to make the code as scalable as possible with NN size etc., but there are still may improvements to be made.
+    Implementation of a base Pyomo model to train collocation-based Neural ODEs 
+    using the IPOPT solver. 
     """
     def __init__(self, 
-            Y_obs, layer_sizes, end_time, 
-            state_lower_bound, state_upper_bound, 
-            param_lower_bound, param_upper_bound,
-            lambda_reg, 
-            Y_smooth=None, 
-            transcription_method='dc',
-            rho_reg=None,
-            num_res_eval_nodes=None, 
+            Y_obs: np.ndarray, 
+            layer_sizes: list, 
+            end_time: float,
+            state_lower_bound: float, state_upper_bound: float,
+            param_lower_bound: float, param_upper_bound: float,
+            l2_reg_param: float,
+            Y_smooth: np.ndarray = None,
+            transcription_method: str = 'dc',
+            irrdc_param: float = None,
+            num_res_eval_nodes: int = None,
     ):
         self.Y_obs = Y_obs # observed state trajectory from measurements. ndarray (num_nodes, state_dim)
         self.num_colloc_nodes, self.state_dim = self.Y_obs.shape
@@ -46,19 +52,19 @@ class NODEPyomo:
         self.state_upper_bound = state_upper_bound
         self.param_lower_bound = param_lower_bound
         self.param_upper_bound = param_upper_bound
-        self.lambda_reg = lambda_reg # regularisation hyperparameter for loss function 
+        self.l2_reg_param = l2_reg_param # L2 regularisation hyperparameter for loss function
         self.Y_smooth = Y_smooth if Y_smooth is not None else Y_obs # noise-free trajectory for Y_star init
         
         self.transcription_method = transcription_method
 
         if self.transcription_method == 'irrdc': 
-            if rho_reg is None or num_res_eval_nodes is None:
-                raise ValueError("Need to set hyperparameter rho_reg and num_res_eval_nodes for IRRDC method.")
+            if irrdc_param is None or num_res_eval_nodes is None:
+                raise ValueError("Need to set hyperparameter irrdc_param and num_res_eval_nodes for irrdc method.")
             self.num_res_eval_nodes = num_res_eval_nodes
             self.res_eval_grid = bary.res_eval_grid
             self.L_res = bary.L_res
             self.D_res = bary.D_res
-            self.rho_reg = rho_reg # regularisation hyperparameter for residual penalty term 
+            self.irrdc_param = irrdc_param # regularisation hyperparameter for residual penalty term 
             self.quadrature_ws = bary.quadrature_ws # quadrature weights for residual penalty term
         
         self.build_model()
@@ -129,7 +135,7 @@ class NODEPyomo:
             for j in range(1, self.layer_sizes[l] + 1)
         )
 
-        reg_l2_norm = self.lambda_reg * l2_norm
+        reg_l2_norm = self.l2_reg_param * l2_norm
 
         return mse + reg_l2_norm
     
@@ -139,7 +145,7 @@ class NODEPyomo:
         reg_mse = self.dc_objective_rule(model) 
 
         # Residual penalty term: (1 / (2 * rho)) * sum_n(w_m * ||interpolant_m||_2^2) 
-        residual_penalty = (1 / (2 * self.rho_reg)) * sum(
+        residual_penalty = (1 / (2 * self.irrdc_param)) * sum(
             self.quadrature_ws[m-1] * (model.ode_lhs_res[m, d] - nn_output_res[m-1, d-1])**2
             for m in model.m
             for d in model.d
@@ -306,31 +312,27 @@ class NODEPyomo:
             self.model.Ws[l].W.fix()
             self.model.bs[l].b.fix()
 
-    def solve_model(self, solver_options):
-        '''
-        Solve the Pyomo model using the IPOPT solver.
-        
-        Args:
-            solver_options: dictionary of solver options specific to the transcription method used.
-        '''
+    def solve_model(self, solver_options: dict):
+        '''Solve the Pyomo model using the IPOPT solver.'''
         # set up IPOPT solver
-        #solver = pyo.SolverFactory("ipopt", executable="/usr/local/bin/ipopt")
-        solver = pyo.SolverFactory("ipopt", executable="/opt/homebrew/bin/ipopt")
+        solver = pyo.SolverFactory("ipopt", executable="/usr/local/bin/ipopt")
+        #solver = pyo.SolverFactory("ipopt", executable="/opt/homebrew/bin/ipopt")
         #print("Solver available?: {}".format(solver.available())) 
         #print("\nInitial NN parameter summary stats (pre-IPOPT): ")
         #self.check_param_values()
         
-        # set global solver options
+        # Numeric run limits (not in the option file) come from solver_options; all other IPOPT
+        # settings (linear_solver, nlp scaling, mu_strategy, print_level, HSL lib, ...) are read
+        # from the option file in the repo root (CNODE/ipopt.opt).
         solver.options['max_iter'] = solver_options["max_iter"]
-        solver.options['nlp_scaling_method'] = solver_options["nlp_scaling_method"]
-        solver.options['mu_strategy'] = solver_options["mu_strategy"]
-        solver.options['tol'] = solver_options["tol"] 
+        solver.options['tol'] = solver_options["tol"]
         solver.options['acceptable_tol'] = solver_options["acceptable_tol"]
         solver.options['acceptable_iter'] = solver_options["acceptable_iter"]
-        repo_root = Path(__file__).resolve().parents[2]
+        repo_root = Path(__file__).resolve().parents[3]  # .../CNODE
         option_path = repo_root / "ipopt.opt"
-        if option_path.exists():
-            solver.options["option_file_name"] = str(option_path)
+        if not option_path.exists():
+            raise FileNotFoundError(f"IPOPT option file not found at {option_path}")
+        solver.options["option_file_name"] = str(option_path)
 
         t0 = time.perf_counter()
         result = solver.solve(self.model, tee=True)

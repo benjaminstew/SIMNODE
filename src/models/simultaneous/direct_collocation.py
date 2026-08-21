@@ -8,7 +8,7 @@ class BarycentricInterpolation:
     Uses formulas from https://people.maths.ox.ac.uk/trefethen/barycentric.pdf 
     to compute the barycentric weights, interpolant matrix and collocation differentiation matrix. 
     """
-    def __init__(self, start_time, end_time, num_colloc_nodes, transcription_method=None, num_res_eval_nodes=None):
+    def __init__(self, start_time: float, end_time: float, num_colloc_nodes: int, transcription_method: str = None, num_res_eval_nodes: int = None):
         self.start_time = start_time
         self.end_time = end_time
         self.num_colloc_nodes = num_colloc_nodes
