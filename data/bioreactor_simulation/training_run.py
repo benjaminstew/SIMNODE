@@ -131,7 +131,7 @@ def training_run(
             late_solver_options=admm_late_solver_options,
             admm_primal_res_tol=0.1,                  
             admm_dual_res_tol=0.1,                   
-            max_admm_iterations=150,
+            max_admm_iterations=300,
             num_early_iterations=10, # opening iters using early_solver_options
             training_clock_budget=30, # minutes; None = no wall-clock cap
             mse_eval_options=mse_eval_options

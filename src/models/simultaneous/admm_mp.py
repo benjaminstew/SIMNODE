@@ -1,13 +1,10 @@
-'''
-multiprocessing wrapper to organize NODEPyomo submodels for ADMM-based batched training.
-'''
+'''multiprocessing wrapper to organize NODEPyomo submodels for ADMM-based batched training.'''
 from src.models.simultaneous.node_pyomo_admm import NODEPyomo
 import numpy as np
 import time
 import threading
 import multiprocessing as mp
 from scipy.integrate import solve_ivp
-
 
 # ---- MODULE LEVEL FUNCTIONS (required for mp.Pool pickling) ----
 WORKER = None   # child processes (independent memory) each have own WORKER instance
@@ -50,6 +47,7 @@ class MPWorker:
     def __init__(self, worker_id: int, submodel_config: dict):
         self.worker_id = worker_id
         self.layer_sizes = submodel_config['layer_sizes']
+
         self.submodel = NODEPyomo(
             Y_obs=submodel_config['Y_obs'][worker_id],
             layer_sizes=self.layer_sizes,
@@ -64,17 +62,33 @@ class MPWorker:
             transcription_method=submodel_config['transcription_method'],
             irrdc_param=submodel_config['irrdc_param'],
             num_res_eval_nodes=submodel_config['num_res_eval_nodes'],
-            obs_times=submodel_config['obs_times'],
+            obs_times=submodel_config['obs_times']          
         )
-        self.submodel_Ws = [0 for _ in range(len(self.layer_sizes) - 1)]
-        self.submodel_bs = [0 for _ in range(len(self.layer_sizes) - 1)] 
-        # set to Xavier init ws/zero init bs
-        for l in range(1, len(self.layer_sizes)):
-            dict_Ws = self.submodel.model.Ws[l].W.extract_values()
-            dict_bs = self.submodel.model.bs[l].b.extract_values()
-            self.submodel_Ws[l-1] = self.dict_to_ndarray(dict_Ws, (self.layer_sizes[l-1], self.layer_sizes[l]))
-            self.submodel_bs[l-1] = self.dict_to_ndarray(dict_bs, (1, self.layer_sizes[l]))
 
+        if submodel_config['warm_init']:
+            self.submodel_Ws = submodel_config['warm_init_submodel_Ws'][worker_id] 
+            self.submodel_bs = submodel_config['warm_init_submodel_bs'][worker_id] 
+            # broadcast warm init submodel params, consensus params and dual vars from the b=0 warmup solve 
+            self.broadcast_consensus_and_duals(
+                submodel_config['warm_init_consensus_Ws'],
+                submodel_config['warm_init_consensus_bs'],
+                submodel_config['init_dual_var_Ws'][worker_id],
+                submodel_config['init_dual_var_bs'][worker_id],
+                iteration_count=0,
+                warm_init=submodel_config['warm_init'],
+                warm_init_submodel_Ws=submodel_config['warm_init_submodel_Ws'][worker_id],
+                warm_init_submodel_bs=submodel_config['warm_init_submodel_bs'][worker_id]
+            )
+        else:
+            self.submodel_Ws = [None for _ in range(len(self.layer_sizes) - 1)]
+            self.submodel_bs = [None for _ in range(len(self.layer_sizes) - 1)]
+            # set to Xavier init ws/zero init bs
+            for l in range(1, len(self.layer_sizes)):
+                dict_Ws = self.submodel.model.Ws[l].W.extract_values()
+                dict_bs = self.submodel.model.bs[l].b.extract_values()
+                self.submodel_Ws[l-1] = self.dict_to_ndarray(dict_Ws, (self.layer_sizes[l-1], self.layer_sizes[l]))
+                self.submodel_bs[l-1] = self.dict_to_ndarray(dict_bs, (1, self.layer_sizes[l]))
+       
     def dict_to_ndarray(self, d: dict, shape: tuple):
         arr = np.zeros(shape, dtype=float)
         for (i, j), val in d.items():
@@ -97,7 +111,9 @@ class MPWorker:
     def broadcast_consensus_and_duals(self,
             consensus_Ws: list, consensus_bs: list,
             dual_var_Ws: list, dual_var_bs: list, 
-            iteration_count: int
+            iteration_count: int,
+            warm_init: bool = False, 
+            warm_init_submodel_Ws: list = None, warm_init_submodel_bs: list = None
     ):  
         for l in range(1, len(self.layer_sizes)):
             self.submodel.model.consensus_Ws[l].W.store_values(self.ndarray_to_dict(consensus_Ws[l-1]))
@@ -106,10 +122,14 @@ class MPWorker:
             self.submodel.model.dual_var_bs[l].b.store_values(self.ndarray_to_dict(dual_var_bs[l-1]))
 
             # warm start submodel from consensus params (to help convergence)
-            if iteration_count > 10: 
+            if iteration_count >= 1: 
                 self.submodel.model.Ws[l].W.set_values(self.ndarray_to_dict(consensus_Ws[l-1]))
                 self.submodel.model.bs[l].b.set_values(self.ndarray_to_dict(consensus_bs[l-1]))
-                #print(f"\nWORKER {self.worker_id}: WARM START FROM CONSENSUS PARAMS FOR LAYER {l}.\n")
+
+            # warm init submodel from b=0 submodel params
+            if warm_init:
+                self.submodel.model.Ws[l].W.set_values(self.ndarray_to_dict(warm_init_submodel_Ws[l-1]))
+                self.submodel.model.bs[l].b.set_values(self.ndarray_to_dict(warm_init_submodel_bs[l-1]))
 
 
 class PoolManager:
@@ -170,6 +190,7 @@ class ADMM:
             l2_reg_param: float,
             admm_penalty_param: float,
             use_pool: bool = False,
+            warm_init: bool = True,
             transcription_method: str = 'dc',
             irrdc_param: float = None,
             num_res_eval_nodes: int = None,
@@ -191,6 +212,15 @@ class ADMM:
         self.num_res_eval_nodes = num_res_eval_nodes
         self.obs_times = obs_times  # submodels interpolate Y_obs onto the collocation grid if not already 
 
+        self.dual_var_Ws, self.dual_var_bs = self.zero_init_dual_vars()
+        if warm_init:
+            self.consensus_Ws, self.consensus_bs, self.submodels_Ws, self.submodels_bs = self.warm_init_params()
+        else:
+            self.consensus_Ws = [np.zeros((self.layer_sizes[l], self.layer_sizes[l+1])) for l in range(len(self.layer_sizes) - 1)]
+            self.consensus_bs = [np.zeros((1, self.layer_sizes[l+1])) for l in range(len(self.layer_sizes) - 1)]
+            self.submodels_Ws = [[None for _ in range(len(self.layer_sizes) - 1)] for _ in range(self.num_batches)]
+            self.submodels_bs = [[None for _ in range(len(self.layer_sizes) - 1)] for _ in range(self.num_batches)]
+
         submodel_config = {
             'Y_obs': Y_obs,
             'layer_sizes': layer_sizes,
@@ -204,7 +234,14 @@ class ADMM:
             'transcription_method': transcription_method,
             'irrdc_param': irrdc_param,
             'num_res_eval_nodes': num_res_eval_nodes,
-            'obs_times': obs_times
+            'obs_times': obs_times, 
+            'init_dual_var_Ws': self.dual_var_Ws, 
+            'init_dual_var_bs': self.dual_var_bs,
+            'warm_init': warm_init, 
+            'warm_init_consensus_Ws': self.consensus_Ws, 
+            'warm_init_consensus_bs': self.consensus_bs, 
+            'warm_init_submodel_Ws': self.submodels_Ws, 
+            'warm_init_submodel_bs': self.submodels_bs
         }
 
         if use_pool:
@@ -214,23 +251,21 @@ class ADMM:
             self.workers = [MPWorker(i, submodel_config) for i in range(self.num_batches)] 
             self.pool_manager = None
 
-        self.dual_var_Ws, self.dual_var_bs = self.zero_init_dual_vars()
-        # consensus params are warm-initialised at the start of run_admm_training (needs solver options)
-        self.consensus_Ws, self.consensus_bs = None, None
-        self.submodels_Ws = [[0 for _ in range(len(layer_sizes) - 1)] for _ in range(self.num_batches)]
-        self.submodels_bs = [[0 for _ in range(len(layer_sizes) - 1)] for _ in range(self.num_batches)]
-        self.iteration_count = 0
-
         self.mse_history = {
             "time_min": [],
             "train_mse": [], "train_mse_std": [],
             "test_mse": [], "test_mse_std": [],
         }
 
-    def warm_init_consensus_params(self, solver_options: dict):
-        '''Warm-initialise the consensus parameters from a single (unpenalised) submodel solve.'''
+    # ----------------- ADMM INITIALISATION METHODS -------------------
+
+    def warm_init_params(self):
+        '''
+        Warm-initialise the consensus params and  
+        all submodel params from a single (unpenalised) submodel solve.
+        '''
         warmup_model = NODEPyomo(
-            Y_obs=self.Y_obs[0],
+            Y_obs=self.Y_obs[0], # choose first batch for warmup solve
             layer_sizes=self.layer_sizes,
             end_time=self.end_time,
             state_lower_bound=self.state_lower_bound, state_upper_bound=self.state_upper_bound,
@@ -242,15 +277,23 @@ class ADMM:
             num_res_eval_nodes=self.num_res_eval_nodes,
             obs_times=self.obs_times
         )
+        solver_options = {
+            "max_iter": 1000,
+            "tol": 1e-7,
+            "acceptable_tol": 1e-6,
+            "acceptable_iter": 15,
+        }
         warmup_model.solve_model(solver_options)
         init_consensus_Ws = [warmup_model.pyomo_var_to_numpy(
                                 warmup_model.model.Ws[l].W, (self.layer_sizes[l-1], self.layer_sizes[l])
                             ) for l in warmup_model.model.l]
         init_consensus_bs = [warmup_model.pyomo_var_to_numpy(
                                 warmup_model.model.bs[l].b, (1, self.layer_sizes[l])
-                            )for l in warmup_model.model.l]
+                            ) for l in warmup_model.model.l]
+        init_submodels_Ws = [[w.copy() for w in init_consensus_Ws] for _ in range(self.num_batches)]
+        init_submodels_bs = [[b.copy() for b in init_consensus_bs] for _ in range(self.num_batches)]
 
-        return init_consensus_Ws, init_consensus_bs
+        return init_consensus_Ws, init_consensus_bs, init_submodels_Ws, init_submodels_bs
 
     def zero_init_dual_vars(self):
         dual_var_Ws = [
@@ -266,25 +309,25 @@ class ADMM:
 
     # ------------ SUBMODEL SOLVE METHODS -----------------
 
-    def solve_submodels_sequential(self, solver_options: dict):
+    def solve_submodels_sequential(self, solver_options: dict, iteration_count: int):
         for i in range(self.num_batches):
             self.workers[i].broadcast_consensus_and_duals(
                 self.consensus_Ws, self.consensus_bs,
-                self.dual_var_Ws[i], self.dual_var_bs[i], 
-                self.iteration_count
+                self.dual_var_Ws[i], self.dual_var_bs[i],
+                iteration_count
             )
             self.workers[i].solve_submodel(solver_options)
             self.submodels_Ws[i] = self.workers[i].submodel_Ws
             self.submodels_bs[i] = self.workers[i].submodel_bs
 
-    def solve_submodels_parallel(self, solver_options: dict):
+    def solve_submodels_parallel(self, solver_options: dict, iteration_count: int):
         payload = {
             "consensus_Ws": self.consensus_Ws,
             "consensus_bs": self.consensus_bs,
             "dual_var_Ws": self.dual_var_Ws,
             "dual_var_bs": self.dual_var_bs,
-            "solver_options": solver_options, 
-            "iteration_count": self.iteration_count
+            "solver_options": solver_options,
+            "iteration_count": iteration_count
         }
         results = self.pool_manager.map(payload)
         for worker_id, submodel_Ws, submodel_bs in results:
@@ -372,10 +415,17 @@ class ADMM:
 
     #--------------------------- MAIN ADMM LOOP --------------------------------
 
-    def set_solver_options(self, early_solver_options: dict, late_solver_options: dict, num_early_iterations: int):
-        '''IPOPT options for the current ADMM iteration: the soft `early_solver_options` for the
-        first `num_early_iterations` iterations, then the standard `late_solver_options`.'''
-        if self.iteration_count < num_early_iterations:
+    def set_solver_options(self, 
+            early_solver_options: dict, 
+            late_solver_options: dict, 
+            num_early_iterations: int, 
+            iteration_count: int
+    ):
+        '''
+        IPOPT options for the current ADMM iteration: the soft `early_solver_options' for the
+        first `num_early_iterations` iterations, then the standard `late_solver_options'.
+        '''
+        if iteration_count < num_early_iterations:
             return early_solver_options
         return late_solver_options
 
@@ -390,8 +440,8 @@ class ADMM:
             mse_eval_options: dict = None
     ):
         '''Run the ADMM consensus training loop.'''
-        # warm-initialise the consensus params (single unpenalised submodel solve)
-        self.consensus_Ws, self.consensus_bs = self.warm_init_consensus_params(late_solver_options)
+
+        iteration_count = 0
 
         # "near" convergence band: accept convergence if BOTH residuals stay within
         # (tol + near_tol) = 1.1 * tol for a number of CONSECUTIVE iterations.
@@ -404,17 +454,17 @@ class ADMM:
             for iteration in range(max_admm_iterations):
                 print(f"ADMM iteration {iteration + 1}")
                 solver_options = self.set_solver_options(
-                    early_solver_options, late_solver_options, num_early_iterations
+                    early_solver_options, late_solver_options, num_early_iterations, iteration_count
                 )
                 if self.use_pool:
-                    self.solve_submodels_parallel(solver_options)
+                    self.solve_submodels_parallel(solver_options, iteration_count)
                 else:
-                    self.solve_submodels_sequential(solver_options)
+                    self.solve_submodels_sequential(solver_options, iteration_count)
                 old_consensus_Ws, old_consensus_bs = self.update_consensus_params()
                 self.update_dual_vars()
                 r_primal = self.compute_primal_residual()
                 s_dual = self.compute_dual_residual(old_consensus_Ws, old_consensus_bs)
-                self.iteration_count += 1
+                iteration_count += 1
                 print(f"Primal residual: {r_primal:.6f}")
                 print(f"Dual residual: {s_dual:.6f}")
 
@@ -445,7 +495,7 @@ class ADMM:
 
                 # ADMM has converged only when BOTH the primal and dual residuals are small.
                 if r_primal <= admm_primal_res_tol and s_dual <= admm_dual_res_tol:
-                    print(f"ADMM converged (primal & dual residuals) after {self.iteration_count} iterations!")
+                    print(f"ADMM converged (primal & dual residuals) after {iteration_count} iterations!")
                     break
 
                 # accept once BOTH residuals sit within the loose band for 5
@@ -456,12 +506,12 @@ class ADMM:
                     near_conv_count = 0
                 if near_conv_count >= 5:
                     print(f"ADMM converged (both residuals within near-tol for {near_conv_count} "
-                          f"consecutive iters) after {self.iteration_count} iterations!")
+                          f"consecutive iters) after {iteration_count} iterations!")
                     break
 
                 # stop if the wall-clock training budget is reached (training-only time)
                 if training_clock_budget is not None and (time.perf_counter() - t_start) / 60.0 >= training_clock_budget:
-                    print(f"ADMM stopped: {training_clock_budget} min wall-clock budget reached at iter {self.iteration_count}.")
+                    print(f"ADMM stopped: {training_clock_budget} min wall-clock budget reached at iter {iteration_count}.")
                     break
 
                 # max_admm_iterations is enforced by the enclosing for-loop range()
