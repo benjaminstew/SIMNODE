@@ -119,8 +119,9 @@ def training_run(
             param_lower_bound=-50,
             param_upper_bound=50,
             l2_reg_param=1e-4,
-            admm_penalty_param=1,               
-            use_pool=True,                           
+            adaptive_penalty_update=True,       # adapt rho each iteration via residual balancing
+            fixed_admm_penalty_param=None,      # only used when adaptive_penalty_update=False
+            use_pool=True,
             transcription_method='dc',
             irrdc_param=None,                        
             num_res_eval_nodes=None                  
@@ -129,21 +130,20 @@ def training_run(
         admm_training_options = dict(
             early_solver_options=admm_early_solver_options,
             late_solver_options=admm_late_solver_options,
-            admm_primal_res_tol=0.1,                  
-            admm_dual_res_tol=0.1,                   
-            max_admm_iterations=300,
+            admm_primal_res_tol=0.05,                  
+            admm_dual_res_tol=0.05,                   
+            max_admm_iterations=1000,
             num_early_iterations=10, # opening iters using early_solver_options
             training_clock_budget=30, # minutes; None = no wall-clock cap
             mse_eval_options=mse_eval_options
         )
         print("\n\nTraining ADMM consensus model (DC) ...\n\n")
         admm = ADMM(**admm_config)
-        t0 = time.perf_counter()
         admm.run_admm_training(**admm_training_options)
-        train_runtimes['dc'] = time.perf_counter() - t0
+        train_runtimes['dc'] = admm.train_runtime
         mse_histories['dc'] = admm.mse_history
         final_mses['dc'] = (admm.mse_history['train_mse'][-1], admm.mse_history['test_mse'][-1])
-        print(f"  {method_labels['dc']} training time: {train_runtimes['dc']:.1f}s")
+        print(f"{method_labels['dc']} training time: {train_runtimes['dc']:.1f}s")
 
 
     # ---------------- 2. Sequential Neural ODE baseline (PyTorch) ----------------

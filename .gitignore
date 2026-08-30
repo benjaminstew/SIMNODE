@@ -8,3 +8,4 @@ __pycache__/
 environment.yml
 ipopt.opt
 ./data/bioreactor_simulation/run_scaling_sweep.pbs
+.data

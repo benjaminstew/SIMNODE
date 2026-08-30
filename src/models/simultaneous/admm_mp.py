@@ -23,7 +23,8 @@ def solve_worker(payload: dict):
             payload["consensus_bs"],
             payload["dual_var_Ws"][WORKER.worker_id],
             payload["dual_var_bs"][WORKER.worker_id],
-            payload["iteration_count"]
+            payload["iteration_count"],
+            payload["admm_penalty_param"]
         )
         WORKER.solve_submodel(payload["solver_options"])
         return (WORKER.worker_id, WORKER.submodel_Ws, WORKER.submodel_bs)
@@ -75,6 +76,7 @@ class MPWorker:
                 submodel_config['init_dual_var_Ws'][worker_id],
                 submodel_config['init_dual_var_bs'][worker_id],
                 iteration_count=0,
+                admm_penalty_param=submodel_config['admm_penalty_param'],
                 warm_init=submodel_config['warm_init'],
                 warm_init_submodel_Ws=submodel_config['warm_init_submodel_Ws'][worker_id],
                 warm_init_submodel_bs=submodel_config['warm_init_submodel_bs'][worker_id]
@@ -110,11 +112,15 @@ class MPWorker:
 
     def broadcast_consensus_and_duals(self,
             consensus_Ws: list, consensus_bs: list,
-            dual_var_Ws: list, dual_var_bs: list, 
+            dual_var_Ws: list, dual_var_bs: list,
             iteration_count: int,
-            warm_init: bool = False, 
+            admm_penalty_param: float,
+            warm_init: bool = False,
             warm_init_submodel_Ws: list = None, warm_init_submodel_bs: list = None
-    ):  
+    ):
+        # broadcast the current penalty parameter rho into the submodel objective (mutable Param)
+        self.submodel.model.nu_reg.set_value(admm_penalty_param)
+
         for l in range(1, len(self.layer_sizes)):
             self.submodel.model.consensus_Ws[l].W.store_values(self.ndarray_to_dict(consensus_Ws[l-1]))
             self.submodel.model.consensus_bs[l].b.store_values(self.ndarray_to_dict(consensus_bs[l-1]))
@@ -122,7 +128,7 @@ class MPWorker:
             self.submodel.model.dual_var_bs[l].b.store_values(self.ndarray_to_dict(dual_var_bs[l-1]))
 
             # warm start submodel from consensus params (to help convergence)
-            if iteration_count >= 1: 
+            if iteration_count > 50: 
                 self.submodel.model.Ws[l].W.set_values(self.ndarray_to_dict(consensus_Ws[l-1]))
                 self.submodel.model.bs[l].b.set_values(self.ndarray_to_dict(consensus_bs[l-1]))
 
@@ -188,7 +194,8 @@ class ADMM:
             state_lower_bound: float, state_upper_bound: float,
             param_lower_bound: float, param_upper_bound: float,
             l2_reg_param: float,
-            admm_penalty_param: float,
+            adaptive_penalty_update: bool = True,
+            fixed_admm_penalty_param: float = None, # if no adaptive update, use this fixed value for ρ
             use_pool: bool = False,
             warm_init: bool = True,
             transcription_method: str = 'dc',
@@ -205,7 +212,13 @@ class ADMM:
         self.param_lower_bound = param_lower_bound
         self.param_upper_bound = param_upper_bound
         self.l2_reg_param = l2_reg_param
-        self.admm_penalty_param = admm_penalty_param
+        self.adaptive_penalty_update = adaptive_penalty_update
+        if adaptive_penalty_update:
+            self.admm_penalty_param = 5.0  # initial rho, adapted each ADMM iteration
+        else:
+            if fixed_admm_penalty_param is None:
+                raise ValueError("Must set fixed_admm_penalty_param when adaptive_penalty_update=False.")
+            self.admm_penalty_param = fixed_admm_penalty_param
         self.use_pool = use_pool
         self.transcription_method = transcription_method
         self.irrdc_param = irrdc_param
@@ -230,7 +243,7 @@ class ADMM:
             'param_lower_bound': param_lower_bound,
             'param_upper_bound': param_upper_bound,
             'l2_reg_param': l2_reg_param,
-            'admm_penalty_param': admm_penalty_param,
+            'admm_penalty_param': self.admm_penalty_param, # initial rho (1.0 if adaptive, else fixed)
             'transcription_method': transcription_method,
             'irrdc_param': irrdc_param,
             'num_res_eval_nodes': num_res_eval_nodes,
@@ -256,6 +269,16 @@ class ADMM:
             "train_mse": [], "train_mse_std": [],
             "test_mse": [], "test_mse_std": [],
         }
+
+        # per-iteration ADMM residual / penalty tracking
+        self.residual_history = {
+            "primal_avg": [],        # scalar: mean over subproblems of ||theta_i - consensus||
+            "primal_per_batch": [],  # list[np.ndarray]: per-subproblem primal residual each iter
+            "dual": [],              # scalar: global dual residual rho*||consensus - consensus_old||
+            "rho": [],               # scalar: penalty parameter used that iteration
+        }
+
+        self.train_runtime = 0
 
     # ----------------- ADMM INITIALISATION METHODS -------------------
 
@@ -314,7 +337,8 @@ class ADMM:
             self.workers[i].broadcast_consensus_and_duals(
                 self.consensus_Ws, self.consensus_bs,
                 self.dual_var_Ws[i], self.dual_var_bs[i],
-                iteration_count
+                iteration_count,
+                self.admm_penalty_param
             )
             self.workers[i].solve_submodel(solver_options)
             self.submodels_Ws[i] = self.workers[i].submodel_Ws
@@ -327,7 +351,8 @@ class ADMM:
             "dual_var_Ws": self.dual_var_Ws,
             "dual_var_bs": self.dual_var_bs,
             "solver_options": solver_options,
-            "iteration_count": iteration_count
+            "iteration_count": iteration_count,
+            "admm_penalty_param": self.admm_penalty_param
         }
         results = self.pool_manager.map(payload)
         for worker_id, submodel_Ws, submodel_bs in results:
@@ -366,13 +391,17 @@ class ADMM:
                 )
 
     def compute_primal_residual(self):
-        '''Average over subproblem L2 norm primal residuals'''
-        r_primal = np.zeros(self.num_batches) # store per-subproblem primal residuals 
+        '''
+        Per-subproblem L2-norm primal residuals and their mean.
+        Returns (r_primal_avg, r_primal) where r_primal is the (num_batches,) per-batch vector.
+        '''
+        r_primal = np.zeros(self.num_batches) # store per-subproblem primal residuals
         for i in range(self.num_batches):
             for l in range(len(self.layer_sizes) - 1):
                 r_primal[i] += np.linalg.norm(self.submodels_Ws[i][l] - self.consensus_Ws[l])
                 r_primal[i] += np.linalg.norm(self.submodels_bs[i][l] - self.consensus_bs[l])
-        return 1/self.num_batches * np.sum(r_primal)
+        r_primal_avg = 1/self.num_batches * np.sum(r_primal)
+        return r_primal_avg, r_primal
 
     def compute_dual_residual(self, old_consensus_Ws, old_consensus_bs):
         '''Average over subproblem L2 norm dual residuals'''
@@ -381,6 +410,30 @@ class ADMM:
             s_dual += np.linalg.norm(self.consensus_Ws[l] - old_consensus_Ws[l])
             s_dual += np.linalg.norm(self.consensus_bs[l] - old_consensus_bs[l])
         return self.admm_penalty_param * s_dual
+
+    def update_admm_penalty_param(self, 
+            current_admm_penalty_param: float, 
+            current_primal_res: float, 
+            current_dual_res: float
+    ):
+        '''
+        Update the ADMM penalty parameter based on the current primal and dual residuals.
+        This is a simple heuristic: if the primal residual is much larger than the dual residual,
+        increase the penalty parameter; if the dual residual is much larger, decrease it.
+        '''
+        mu = 2.0  # factor to compare primal and dual residuals
+        tau_incr = 2.0  # factor to increase penalty
+        tau_decr = 2.0  # factor to decrease penalty
+        rho_min, rho_max = 1e-2, 1e2  # clamp so residual balancing can't drift rho to extremes
+
+        if current_primal_res > mu * current_dual_res:
+            new_admm_penalty_param = current_admm_penalty_param * tau_incr
+        elif current_dual_res > mu * current_primal_res:
+            new_admm_penalty_param = current_admm_penalty_param / tau_decr
+        else:
+            new_admm_penalty_param = current_admm_penalty_param
+
+        return float(np.clip(new_admm_penalty_param, rho_min, rho_max))
 
 
     #----------------- WALL-CLOCK CONVERGENCE TRACKING -------------------
@@ -435,7 +488,7 @@ class ADMM:
             admm_primal_res_tol: float,
             admm_dual_res_tol: float,
             max_admm_iterations: int,
-            num_early_iterations: int = 10,
+            num_early_iterations: int = 20,
             training_clock_budget: float = None,
             mse_eval_options: dict = None
     ):
@@ -445,13 +498,17 @@ class ADMM:
 
         # "near" convergence band: accept convergence if BOTH residuals stay within
         # (tol + near_tol) = 1.1 * tol for a number of CONSECUTIVE iterations.
-        near_primal_tol = admm_primal_res_tol * 0.1
-        near_dual_tol = admm_dual_res_tol * 0.1
+        near_primal_tol = admm_primal_res_tol * 0.5
+        near_dual_tol = admm_dual_res_tol * 0.5
         near_conv_count = 0  # consecutive iterations with both residuals inside the loose band
 
         t_start = time.perf_counter()
         try:
             for iteration in range(max_admm_iterations):
+                if self.adaptive_penalty_update and iteration_count > 0:
+                    self.admm_penalty_param = self.update_admm_penalty_param(
+                        self.admm_penalty_param, r_primal, s_dual
+                    )
                 print(f"ADMM iteration {iteration + 1}")
                 solver_options = self.set_solver_options(
                     early_solver_options, late_solver_options, num_early_iterations, iteration_count
@@ -462,16 +519,28 @@ class ADMM:
                     self.solve_submodels_sequential(solver_options, iteration_count)
                 old_consensus_Ws, old_consensus_bs = self.update_consensus_params()
                 self.update_dual_vars()
-                r_primal = self.compute_primal_residual()
+                r_primal, r_primal_per_batch = self.compute_primal_residual()
                 s_dual = self.compute_dual_residual(old_consensus_Ws, old_consensus_bs)
                 iteration_count += 1
-                print(f"Primal residual: {r_primal:.6f}")
+
+                # record per-iteration residuals and the penalty parameter used this iteration
+                t_res0 = time.perf_counter()
+                self.residual_history["primal_avg"].append(float(r_primal))
+                self.residual_history["primal_per_batch"].append(r_primal_per_batch.tolist())
+                self.residual_history["dual"].append(float(s_dual))
+                self.residual_history["rho"].append(float(self.admm_penalty_param))
+
+                print(f"Primal residual (avg): {r_primal:.6f}")
                 print(f"Dual residual: {s_dual:.6f}")
+                print(f"Penalty param rho: {self.admm_penalty_param:.4g}")
+                print("Per-batch primal residuals: "
+                      + np.array2string(r_primal_per_batch, precision=4, max_line_width=np.inf))
+                t_start += time.perf_counter() - t_res0  # exclude residual calculation from timer
 
                 # Record wall-clock convergence (prediction MSE) using the current consensus model
                 # Timer is paused for evaluation
                 if mse_eval_options is not None:
-                    t_eval0 = time.perf_counter()
+                    t_mse0 = time.perf_counter()
                     pred_kw = {
                         "method": mse_eval_options.get("method", "RK45"),
                         "rtol": mse_eval_options.get("rtol", 1e-3),
@@ -484,21 +553,22 @@ class ADMM:
                     test_mse, test_mse_std = self.compute_prediction_mse(
                         mse_eval_options["Y_test_obs"], mse_eval_options["test_grid"], **pred_kw
                     )
-                    elapsed_min = (time.perf_counter() - t_start) / 60.0
-                    self.mse_history["time_min"].append(elapsed_min)
+                    t_msefin = (time.perf_counter() - t_start) / 60.0  # training-only time at eval point
+                    self.mse_history["time_min"].append(t_msefin)
                     self.mse_history["train_mse"].append(train_mse)
                     self.mse_history["train_mse_std"].append(train_mse_std)
                     self.mse_history["test_mse"].append(test_mse)
                     self.mse_history["test_mse_std"].append(test_mse_std)
                     print(f"Train MSE: {train_mse:.6e} | Test MSE: {test_mse:.6e}")
-                    t_start += time.perf_counter() - t_eval0  # exclude eval cost from timer
+                    t_start += time.perf_counter() - t_mse0  # exclude eval cost from timer
 
                 # ADMM has converged only when BOTH the primal and dual residuals are small.
                 if r_primal <= admm_primal_res_tol and s_dual <= admm_dual_res_tol:
                     print(f"ADMM converged (primal & dual residuals) after {iteration_count} iterations!")
+                    self.train_runtime = time.perf_counter() - t_start
                     break
 
-                # accept once BOTH residuals sit within the loose band for 5
+                # accept once BOTH residuals sit within the loose band for 3
                 # CONSECUTIVE iterations (reset the counter as soon as either leaves the band).
                 if (r_primal <= admm_primal_res_tol + near_primal_tol and s_dual <= admm_dual_res_tol + near_dual_tol):
                     near_conv_count += 1
@@ -507,15 +577,19 @@ class ADMM:
                 if near_conv_count >= 5:
                     print(f"ADMM converged (both residuals within near-tol for {near_conv_count} "
                           f"consecutive iters) after {iteration_count} iterations!")
+                    self.train_runtime = time.perf_counter() - t_start
                     break
 
                 # stop if the wall-clock training budget is reached (training-only time)
                 if training_clock_budget is not None and (time.perf_counter() - t_start) / 60.0 >= training_clock_budget:
                     print(f"ADMM stopped: {training_clock_budget} min wall-clock budget reached at iter {iteration_count}.")
+                    self.train_runtime = time.perf_counter() - t_start
                     break
 
                 # max_admm_iterations is enforced by the enclosing for-loop range()
-        
+            # covers exit via max_admm_iterations (no break); break paths set it earlier
+            self.train_runtime = time.perf_counter() - t_start
+
         finally:
             if self.use_pool:
                 self.pool_manager.close()

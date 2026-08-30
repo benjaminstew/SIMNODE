@@ -151,13 +151,15 @@ class NODEPyomo:
 
         if self.admm_submodel:
             # ADMM consensus penalty term: (nu/2) * ||theta - theta_consensus + (1/nu) * dual_var||_2^2
-            consensus_penalty = (self.nu_reg / 2) * (sum(
-                (model.Ws[l].W[i, j] - model.consensus_Ws[l].W[i, j] + (1 / self.nu_reg) * model.dual_var_Ws[l].W[i, j])**2
+            # nu (model.nu_reg) is a mutable Param so the penalty parameter can be adapted each
+            # ADMM iteration; the stored dual_var is unscaled, so (1/nu)*dual_var rescales it live.
+            consensus_penalty = (model.nu_reg / 2) * (sum(
+                (model.Ws[l].W[i, j] - model.consensus_Ws[l].W[i, j] + (1 / model.nu_reg) * model.dual_var_Ws[l].W[i, j])**2
                 for l in model.l
-                for i in range(1, self.layer_sizes[l-1] + 1) 
-                for j in range(1, self.layer_sizes[l] + 1)    
+                for i in range(1, self.layer_sizes[l-1] + 1)
+                for j in range(1, self.layer_sizes[l] + 1)
             ) + sum(
-                (model.bs[l].b[1, j] - model.consensus_bs[l].b[1, j] + (1 / self.nu_reg) * model.dual_var_bs[l].b[1, j])**2
+                (model.bs[l].b[1, j] - model.consensus_bs[l].b[1, j] + (1 / model.nu_reg) * model.dual_var_bs[l].b[1, j])**2
                 for l in model.l
                 for j in range(1, self.layer_sizes[l] + 1)
             ))
@@ -280,8 +282,12 @@ class NODEPyomo:
 
         #---- ADMM CONSENUS PARAMETERS AND DUAL VARIABLES -----
         if self.admm_submodel:
+            # ADMM penalty parameter nu (rho) as a mutable scalar Param so it can be adapted
+            # each ADMM iteration (residual balancing) and broadcast into the submodel objective.
+            self.model.nu_reg = pyo.Param(initialize=self.nu_reg, mutable=True)
+
             # Make ADMM consensus params and dual vars mutable Pyomo Params
-            self.model.consensus_Ws = pyo.Block(self.model.l) 
+            self.model.consensus_Ws = pyo.Block(self.model.l)
             self.model.consensus_bs = pyo.Block(self.model.l) 
             self.model.dual_var_Ws = pyo.Block(self.model.l)
             self.model.dual_var_bs = pyo.Block(self.model.l)
