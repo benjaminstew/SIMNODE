@@ -287,10 +287,7 @@ class NODEPyomo:
             self.last_solve_info dict.
         '''
         # set up IPOPT solver 
-        #solver = pyo.SolverFactory("ipopt", executable="/rds/general/user/bms125/home/miniforge3/envs/cnode/bin/ipopt") # HPC
         solver = pyo.SolverFactory("ipopt", executable="/usr/local/bin/ipopt")
-        #solver = pyo.SolverFactory("ipopt", executable="/opt/homebrew/bin/ipopt") 
-        #print("Solver available?: {}".format(solver.available())) 
 
         solver.options['max_iter'] = solver_options["max_iter"]
         solver.options['tol'] = solver_options["tol"]

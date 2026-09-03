@@ -316,10 +316,6 @@ class NODEPyomo:
         '''Solve the Pyomo model using the IPOPT solver.'''
         # set up IPOPT solver
         solver = pyo.SolverFactory("ipopt", executable="/usr/local/bin/ipopt")
-        #solver = pyo.SolverFactory("ipopt", executable="/opt/homebrew/bin/ipopt")
-        #print("Solver available?: {}".format(solver.available())) 
-        #print("\nInitial NN parameter summary stats (pre-IPOPT): ")
-        #self.check_param_values()
         
         # Numeric run limits (not in the option file) come from solver_options; all other IPOPT
         # settings (linear_solver, nlp scaling, mu_strategy, print_level, HSL lib, ...) are read

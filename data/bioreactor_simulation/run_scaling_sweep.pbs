@@ -1,50 +1,12 @@
 #!/bin/bash
 #PBS -N cnode_scaling_sweep
-#PBS -l select=1:ncpus=45:mem=64gb
-#PBS -l walltime=72:00:00
+#PBS -l select=1:ncpus=50:mem=64gb
+#PBS -l walltime=10:00:00
 #PBS -j oe
 
-# ===========================================================================
-# Dataset-size scaling sweep: monolithic vs ADMM vs sequential Neural-ODE training.
-# Runs data/bioreactor_simulation/run_scaling_sweep.py for B = 2 .. 45.
-#
-# Cores: for each B the ADMM step opens a multiprocessing pool of B IPOPT worker
-# processes (one per trajectory / subproblem). The peak is B = 45, so the job
-# requests ncpus=45. The sweep range (B_MIN=2, B_MAX=45) is set in the CONFIG
-# block of run_scaling_sweep.py -- change it there, not in this file.
-#
-# The sweep renders both plots itself (wall-clock and final-test-MSE vs B) and
-# writes scaling_sweep_results.json, so there is no separate plotting step.
-# ===========================================================================
-
-# ---------------------------------------------------------------------------
-# BEFORE SUBMITTING -- HPC-specific edits the sweep does NOT make for you:
-#   1. IPOPT executable. node_pyomo_base.py, node_pyomo_admm.py AND
-#      node_pyomo_monolithic.py all hard-code
-#          SolverFactory("ipopt", executable="/opt/homebrew/bin/ipopt")   # macOS
-#      Point each at the cluster's ipopt (the commented HPC line is already in
-#      those files, e.g. .../miniforge3/envs/cnode/bin/ipopt).
-#      ($CNODE_IPOPT is no longer read by any model -- you must edit the files.)
-#   2. IPOPT option file CNODE/ipopt.opt references a macOS HSL library:
-#          hsllib /Users/.../libHSL/lib/libhsl.dylib     (.dylib = macOS only)
-#      Repoint it to the Linux HSL on the cluster (.so), or change
-#          linear_solver ma97  ->  a solver available in the HPC IPOPT build.
-#      (All three models read their IPOPT settings from this option file.)
-# ---------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------
-# Conda environment (PBS runs a non-interactive shell -> source conda first)
-# ---------------------------------------------------------------------------
 source /rds/general/user/bms125/home/miniforge3/etc/profile.d/conda.sh
 conda activate cnode
 
-# ---------------------------------------------------------------------------
-# Thread control -- CRITICAL for the up-to-45 concurrent IPOPT workers.
-# Each ADMM worker runs a full IPOPT solve; ma97 (HSL) and the BLAS libraries are
-# OpenMP-threaded, so without pinning, 45 workers x N_threads massively
-# oversubscribes the node (and threaded HSL can segfault). Pin every pool to a
-# single thread so each worker uses exactly one core.
-# ---------------------------------------------------------------------------
 export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
@@ -53,18 +15,5 @@ export NUMEXPR_NUM_THREADS=1
 # Unbuffered output so print() lands in the job log in real time.
 export PYTHONUNBUFFERED=1
 
-# ---------------------------------------------------------------------------
-# Run the sweep (it saves results incrementally and renders both plots at the end).
-# ---------------------------------------------------------------------------
 cd /rds/general/user/bms125/home/CNODE
 python -m data.bioreactor_simulation.run_scaling_sweep
-
-# ---------------------------------------------------------------------------
-# WALLTIME NOTE: training_run.py currently caps ADMM at training_clock_budget=60 min
-# and the sequential baseline at time_budget_min=60 min -- PER batch size B. Across
-# B = 2..45 (44 values) the ADMM + sequential budgets alone can approach
-# 44 x (60 + 60) min ~= 88 h, plus the monolithic solves, which exceeds the 72 h
-# walltime above. If you enable all three arms for the full range, either lower
-# those per-B budgets in training_run.py, split the B range across several jobs,
-# or raise the walltime.
-# ===========================================================================

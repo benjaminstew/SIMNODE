@@ -104,10 +104,10 @@ def training_run(
         }
         # standard tolerances for the remaining ADMM iterations
         admm_late_solver_options = {
-            "max_iter": 500,
-            "tol": 1e-5,
-            "acceptable_tol": 1e-3,
-            "acceptable_iter": 5,
+            "max_iter": 300,
+            "tol": 1e-6,
+            "acceptable_tol": 1e-4,
+            "acceptable_iter": 15,
         }
         admm_config = dict(
             Y_obs=Y_obs,                   
@@ -130,11 +130,14 @@ def training_run(
         admm_training_options = dict(
             early_solver_options=admm_early_solver_options,
             late_solver_options=admm_late_solver_options,
-            admm_primal_res_tol=0.05,                  
-            admm_dual_res_tol=0.05,                   
-            max_admm_iterations=1000,
+            admm_abs_tol=3e-3,   # ε_abs (per-parameter absolute floor)
+            admm_rel_tol=3e-4,   # ε_rel (Boyd-recommended 1e-3..1e-4)
+            max_admm_iterations=500,
             num_early_iterations=10, # opening iters using early_solver_options
+            num_convergence_confirmations=3, # consecutive sub-tol iters before stopping (Boyd: 1)
+            near_stopping_band=1.5,  # early stop when residuals sit within this x eps
             training_clock_budget=30, # minutes; None = no wall-clock cap
+            consensus_aggregator="loss-weighted", # ADMM iteration frequency to check convergence
             mse_eval_options=mse_eval_options
         )
         print("\n\nTraining ADMM consensus model (DC) ...\n\n")
@@ -186,7 +189,7 @@ def training_run(
     # ---------------- 3. Monolithic collocation model (block-diagonal DC) ----------------
     if run_monolithic_baseline:
         monolithic_solver_options = {
-            "max_iter": 3000,
+            "max_iter": 1000,
             "tol": 1e-6,
             "acceptable_tol": 1e-4,
             "acceptable_iter": 15

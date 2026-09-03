@@ -64,7 +64,7 @@ class NODEPyomo:
         self.state_upper_bound = state_upper_bound
         self.param_lower_bound = param_lower_bound
         self.param_upper_bound = param_upper_bound
-        self.lambda_reg = l2_reg_param # regularisation hyperparameter for loss function 
+        self.l2_reg_param = l2_reg_param 
         
         self.transcription_method = transcription_method
         if self.transcription_method == 'irrdc': 
@@ -81,7 +81,7 @@ class NODEPyomo:
         if self.admm_submodel:
             if admm_penalty_param is None:
                 raise ValueError("Must set penalty hyperparameter admm_penalty_param for ADMM submodel.")  
-            self.nu_reg = admm_penalty_param # ADMM penalty parameter for consensus penalty term 
+            self.admm_penalty_param = admm_penalty_param # ADMM penalty parameter for consensus penalty term 
         
         self.build_model()
 
@@ -126,59 +126,60 @@ class NODEPyomo:
             return self.Y_obs[m-1, d-1] + np.random.randn() * 0.1 # self.Y_obs is a 0-indexed ndarray
         return init_rule
     
-    def dc_objective_rule(self, model):
-        '''Returns the objective function for DC as a pyomo expression.'''
+    def local_dc_objective_rule(self, model):
+        '''
+        Underlying DC objective as a pyomo expression, without the ADMM consensus penalty - 
+        (1/N) * ||Y_star - Y_obs||_F^2 + Λ * ||θ||_2^2.
+        '''
         # MSE term: (1/N) * ||Y_star - Y_obs||_F^2
         mse = (1 / self.num_colloc_nodes) * sum(
             (model.Y_star[n, d] - self.Y_obs[n-1, d-1])**2
-            for n in model.n 
+            for n in model.n
             for d in model.d
-        ) 
-
-        # Regularised L2 norm term: lambda * ||theta||_2^2
+        )
+        # Reg L2 norm term: Λ * ||Θ||_2^2
         l2_norm = sum(
             model.Ws[l].W[i, j]**2
             for l in model.l
-            for i in range(1, self.layer_sizes[l-1] + 1) 
-            for j in range(1, self.layer_sizes[l] + 1)    
+            for i in range(1, self.layer_sizes[l-1] + 1)
+            for j in range(1, self.layer_sizes[l] + 1)
         ) + sum(
             model.bs[l].b[1, j]**2
             for l in model.l
             for j in range(1, self.layer_sizes[l] + 1)
         )
 
-        reg_l2_norm = self.lambda_reg * l2_norm
+        return mse + self.l2_reg_param * l2_norm
 
+    def dc_objective_rule(self, model):
+        '''Returns the DC objective function as a pyomo expression.'''
         if self.admm_submodel:
-            # ADMM consensus penalty term: (nu/2) * ||theta - theta_consensus + (1/nu) * dual_var||_2^2
-            # nu (model.nu_reg) is a mutable Param so the penalty parameter can be adapted each
-            # ADMM iteration; the stored dual_var is unscaled, so (1/nu)*dual_var rescales it live.
-            consensus_penalty = (model.nu_reg / 2) * (sum(
-                (model.Ws[l].W[i, j] - model.consensus_Ws[l].W[i, j] + (1 / model.nu_reg) * model.dual_var_Ws[l].W[i, j])**2
+            # ADMM consensus penalty term: (ρ/2) * ||θ - θ_consensus + (1/ρ) * λ||_2^2
+            consensus_penalty = (model.admm_penalty_param / 2) * (sum(
+                (model.Ws[l].W[i, j] - model.consensus_Ws[l].W[i, j] + (1 / model.admm_penalty_param) * model.dual_var_Ws[l].W[i, j])**2
                 for l in model.l
                 for i in range(1, self.layer_sizes[l-1] + 1)
                 for j in range(1, self.layer_sizes[l] + 1)
             ) + sum(
-                (model.bs[l].b[1, j] - model.consensus_bs[l].b[1, j] + (1 / model.nu_reg) * model.dual_var_bs[l].b[1, j])**2
+                (model.bs[l].b[1, j] - model.consensus_bs[l].b[1, j] + (1 / model.admm_penalty_param) * model.dual_var_bs[l].b[1, j])**2
                 for l in model.l
                 for j in range(1, self.layer_sizes[l] + 1)
             ))
-            return mse + reg_l2_norm + consensus_penalty
-
-        return mse + reg_l2_norm
+            return model.local_dc_objective + consensus_penalty
+        
+        return model.local_dc_objective
     
     def irrdc_objective_rule(self, model, nn_output_res):
         '''Returns the objective function for IRR-DC'''
-        # DC terms (& ADMM consensus penalty term if applicable)
         reg_mse = self.dc_objective_rule(model) 
 
-        # Residual penalty term: (1 / (2 * rho)) * sum_n(w_m * ||interpolant_m||_2^2) 
+        # Residual penalty term: (1 / (2 * μ)) * sum_n(w_m * ||interpolant_m||_2^2) 
         residual_penalty = (1 / (2 * self.irrdc_param)) * sum(
             self.quadrature_ws[m-1] * (model.ode_lhs_res[m, d] - nn_output_res[m-1, d-1])**2
             for m in model.m
             for d in model.d
         )
-        
+
         return reg_mse + residual_penalty
 
     def build_model(self):
@@ -282,9 +283,9 @@ class NODEPyomo:
 
         #---- ADMM CONSENUS PARAMETERS AND DUAL VARIABLES -----
         if self.admm_submodel:
-            # ADMM penalty parameter nu (rho) as a mutable scalar Param so it can be adapted
+            # ADMM penalty parameter as a mutable scalar Param so it can be adapted
             # each ADMM iteration (residual balancing) and broadcast into the submodel objective.
-            self.model.nu_reg = pyo.Param(initialize=self.nu_reg, mutable=True)
+            self.model.admm_penalty_param = pyo.Param(initialize=self.admm_penalty_param, mutable=True)
 
             # Make ADMM consensus params and dual vars mutable Pyomo Params
             self.model.consensus_Ws = pyo.Block(self.model.l)
@@ -321,6 +322,10 @@ class NODEPyomo:
                     initialize=0.0,
                     mutable=True
                 )
+
+        # Named Expression for the underlying DC objective (mse + l2 reg, no ADMM consensus
+        # penalty), so it can be extracted from model after each solve.
+        self.model.local_dc_objective = pyo.Expression(rule=lambda m: self.local_dc_objective_rule(m))
 
         # Build Pyomo objective function based on transcription method
         self.build_objective(nn_output_res)
@@ -385,10 +390,7 @@ class NODEPyomo:
     def solve_model(self, solver_options: dict):
         '''Solve the Pyomo model using the IPOPT solver.'''
         # set up IPOPT solver
-        #solver = pyo.SolverFactory("ipopt", executable="/rds/general/user/bms125/home/miniforge3/envs/cnode/bin/ipopt") # HPC
         solver = pyo.SolverFactory("ipopt", executable="/usr/local/bin/ipopt")
-        #solver = pyo.SolverFactory("ipopt", executable="/opt/homebrew/bin/ipopt") 
-        #print("Solver available?: {}".format(solver.available())) 
         
         # Numeric run limits (not in the option file) come from solver_options; all other IPOPT
         # settings (linear_solver, nlp scaling, mu_strategy, print_level, HSL lib, ...) are read
@@ -407,7 +409,7 @@ class NODEPyomo:
         # load_solutions=True lets Pyomo load the solution straight into the model on success.
         # Wrapped in try/except so a genuinely failed solve (no solution returned) keeps the
         # submodel's warm-start params instead of raising and crashing the multiprocessing pool.
-        # NOTE: with load_solutions=True Pyomo EMPTIES result.solution after loading, so success
+        # note: with load_solutions=True Pyomo EMPTIES result.solution after loading, so success
         # must be judged from the solver status / termination condition, NOT len(result.solution).
         result = None
         try:
@@ -436,6 +438,12 @@ class NODEPyomo:
             "iterations": int(iterations) if iterations is not None else None,
             "solve_wall_time_s": solve_wall_time,
             "solution_loaded": solution_loaded,
+            # Final objective IPOPT minimised this solve. Gated on solution_loaded: an
+            # unloaded solve leaves warm-start params in the model, so an ungated read would
+            # report the warm-start objective, not a real solve result.
+            "objective": float(pyo.value(self.model.obj)) if solution_loaded else float("nan"),
+            # Underlying DC objective (mse + l2 reg), without the ADMM consensus penalty.
+            "local_dc_objective": float(pyo.value(self.model.local_dc_objective)) if solution_loaded else float("nan"),
         }
 
         if solution_loaded:
