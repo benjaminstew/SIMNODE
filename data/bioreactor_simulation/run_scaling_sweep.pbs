@@ -1,6 +1,6 @@
 #!/bin/bash
 #PBS -N cnode_scaling_sweep
-#PBS -l select=1:ncpus=50:mem=64gb
+#PBS -l select=1:ncpus=110:mem=64gb
 #PBS -l walltime=10:00:00
 #PBS -j oe
 

@@ -1,161 +1,118 @@
 """
-Training-set-size scaling sweep.
+Script to run a training-set-size scaling sweep and extract per-batch size training metrics.
 
-Sweeps the number of training trajectories B = 2 .. 45 (with a fixed 5-trajectory test
-set) and, for each B, trains three Neural-ODE models on the SAME split.
+Sweeps the number of training trajectories B (with a fixed test set) 
+and, for each B, trains three Neural-ODE models on the same split:
+-- monolithic collocation model (Pyomo/IPOPT, block-diagonal DC)   -> 'mono'
+-- ADMM consensus collocation model (Pyomo/IPOPT, DC)              -> 'admm'
+-- sequential Neural ODE baseline (PyTorch / torchdiffeq)          -> 'seq'
 
-  - monolithic collocation model (Pyomo/IPOPT, block-diagonal DC)   -> 'mono'
-  - ADMM consensus collocation model (Pyomo/IPOPT, DC)              -> 'dc'
-  - sequential Neural ODE baseline (PyTorch / torchdiffeq)          -> 'seq'
-
-Produces one plot -- wall-clock training time (s) vs number of training batches B, one
-line per model -- and saves the raw timings to ``scaling_sweep_results.json''
-
-Run from the repo root:  python -m data.bioreactor_simulation.run_scaling_sweep
+Produces .json file containing, for each B in sweep: 
+-- wall-clock training time (s) 
+-- train and test MSEs
+-- final train and test MSEs
+-- primal and dual residuals at each iteration (for ADMM)
+-- number of IPOPT iterations (for ADMM and monolithic)
+-- trained NN params per model (for forward prediction)
 """
 import json
+import argparse 
 import os
 from pathlib import Path
 import numpy as np
-import matplotlib.pyplot as plt
 
-from data.bioreactor_simulation.training_run import training_run as training_main
+from data.bioreactor_simulation.run_training import run_training
 
 # ------------------------------- CONFIG -------------------------------
-DATA_PATH = "./data/bioreactor_simulation/raw_data/noise_level_01_eps0.01.csv"
 STATE_COLS = ['G', 'O', 'X', 'Xd', 'P', 'L', 'CO2']
 NN_LAYER_SIZES = [len(STATE_COLS), 16, len(STATE_COLS)]
 NUM_TEST = 5
-B_MIN, B_MAX = 2, 8 # sweep B = 2 .. 45 training trajectories
+B_MIN, B_MAX = 2, 3 # sweep B = 2 .. 45 training trajectories
 SEED = 0 # fixes the train/test split per B (reproducible)
-RESULTS_PATH = Path(os.environ.get("CNODE_RESULTS_PATH", 
-                    str(Path(__file__).with_name("scaling_sweep_results.json"))))
-WALLCLOCK_PLOT_PATH = Path(__file__).with_name("scaling_walltime_vs_batches.png")
-MSE_PLOT_PATH = Path(__file__).with_name("scaling_test_mse_vs_batches.png")
 
-# plotting identity (methods in the desired legend order)
-METHOD_ORDER = ('mono', 'dc', 'seq')
-METHOD_LABELS = {
-    'mono': 'Monolithic (DC)',
-    'dc': 'ADMM consensus (DC)',
-    'seq': 'Sequential (torchdiffeq)',
-}
-METHOD_COLORS = {
-    'mono': (200 / 255, 120 / 255, 120 / 255),
-    'dc': (160 / 255, 190 / 255, 200 / 255),
-    'seq': (150 / 255, 200 / 255, 150 / 255),
-}
+def extract_trained_params(method: str, model) -> dict:
+    """Pull a model's trained NN weights/biases as JSON-serialisable nested lists.
 
-def plot_test_mse(out, path):
-    """Plot final test-set MSE vs number of training batches (one line per model)."""
-    results = out["results"]
-    Bs = sorted(int(b) for b in results.keys())
+    The live model objects (Pyomo/IPOPT state) cannot be serialised, but the fitted
+    NN parameters are small ndarrays. We want those so the plot scripts can
+    forward-integrate trajectories without re-running training.
+      - 'admm' -> consensus_Ws / consensus_bs (the converged consensus model)
+      - 'mono' -> convert_weights() / convert_biases() (read back from the solved model)
+    """
+    if method == 'admm':
+        Ws, bs = model.consensus_Ws, model.consensus_bs
+    elif method == 'mono':
+        Ws, bs = model.convert_weights(), model.convert_biases()
+    else:
+        raise ValueError(f"\nUnknown model: {method}")
+    return {
+        "Ws": [np.asarray(W, dtype=float).tolist() for W in Ws],
+        "bs": [np.asarray(b, dtype=float).tolist() for b in bs],
+    }
 
-    fig, ax = plt.subplots(figsize=(7.5, 5))
-    any_data = False
-    for method in METHOD_ORDER:
-        xs, ys = [], []
-        for B in Bs:
-            fm = results[str(B)].get("final_mses", {})
-            pair = fm.get(method)  # [final_train_mse, final_test_mse]
-            if pair is not None and len(pair) == 2 and np.isfinite(pair[1]):
-                xs.append(B)
-                ys.append(float(pair[1]))  # index 1 = final TEST MSE
-        if xs:
-            any_data = True
-            ax.plot(xs, ys, marker='o', markersize=4, linewidth=1.6,
-                    color=METHOD_COLORS[method], label=METHOD_LABELS[method])
-
-    ax.set_xlabel("Number of training batches, B")
-    ax.set_ylabel("Final test-set MSE")
-    ax.set_title("Final test MSE vs training-set size")
-    if any_data:
-        ax.set_yscale("log")
-    ax.grid(True, which="both", linestyle="--", color="lightgrey", alpha=0.7)
-    ax.legend()
-    fig.tight_layout()
-    fig.savefig(path, dpi=200, bbox_inches="tight")
-    plt.close(fig)
-    print(f"wrote {path}")
-
-def plot(out, path):
-    """Plot wall-clock training time vs number of training batches (one line per model)."""
-    results = out["results"]
-    Bs = sorted(int(b) for b in results.keys())
-
-    fig, ax = plt.subplots(figsize=(7.5, 5))
-    any_data = False
-    for method in METHOD_ORDER:
-        xs, ys = [], []
-        for B in Bs:
-            rt = results[str(B)].get("train_runtimes", {})
-            t = rt.get(method)
-            if t is not None and np.isfinite(t):
-                xs.append(B)
-                ys.append(float(t))
-        if xs:
-            any_data = True
-            ax.plot(xs, ys, marker='o', markersize=4, linewidth=1.6,
-                    color=METHOD_COLORS[method], label=METHOD_LABELS[method])
-
-    ax.set_xlabel("Number of training batches, B")
-    ax.set_ylabel("Wall-clock training time (s)")
-    ax.set_title("Training time vs training-set size")
-    if any_data:
-        ax.set_yscale("log")
-    ax.grid(True, which="both", linestyle="--", color="lightgrey", alpha=0.7)
-    ax.legend()
-    fig.tight_layout()
-    fig.savefig(path, dpi=200, bbox_inches="tight")
-    plt.close(fig)
-    print(f"wrote {path}")
 
 def main():
     batch_sizes = list(range(B_MIN, B_MAX + 1))
-
-    print(f"Scaling sweep: B in {batch_sizes}, test set = {NUM_TEST}")
-    print(f"results -> {RESULTS_PATH}")
+    print(f"Scaling sweep: B in {batch_sizes}, test set size = {NUM_TEST}")
+    print(f"results -> {args.results_path}")
 
     out = {
         "config": {
-            "data_path": DATA_PATH,
-            "state_cols": STATE_COLS,
+            "data_path": args.data_path,
+            "state vars": STATE_COLS,
             "nn_layer_sizes": NN_LAYER_SIZES,
-            "num_test": NUM_TEST,
+            "num_test_trajectories": NUM_TEST,
             "batch_sizes": batch_sizes,
-            "seed": SEED,
+            "seed": SEED
         },
         "results": {},
     }
 
     def save():
-        RESULTS_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with open(RESULTS_PATH, "w") as f:
+        args.results_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(args.results_path, "w") as f:
             json.dump(out, f, indent=2)
 
     for B in batch_sizes:
         print(f"\n{'#' * 70}\n# B = {B} training batches\n{'#' * 70}")
         try:
-            res = training_main(
-                data_path=DATA_PATH,
+            res = run_training(
+                data_path=args.data_path,
                 state_cols=STATE_COLS,
                 nn_layer_sizes=NN_LAYER_SIZES,
                 num_train_trajectories=B,
                 num_test_trajectories=NUM_TEST,
+                seed=SEED,
                 run_admm_baseline=True,
                 run_sequential_baseline=False,
                 run_monolithic_baseline=True,
-                seed=SEED,
+                return_models=True 
             )
-            # keep JSON-friendly per-method runtimes and final (train, test) MSEs
-            runtimes = {m: float(t) for m, t in res["train_runtimes"].items()}
+            train_runtimes = {m: float(t) for m, t in res["train_runtimes"].items()}
             final_mses = {m: [float(tr), float(te)] for m, (tr, te) in res.get("final_mses", {}).items()}
+
+            # The *_history objects are already built as dicts-of-lists => JSON-serialisable
+            mse_histories = res.get("mse_histories", {})
+            residual_histories = res.get("residual_histories", {})
+            objective_histories = res.get("objective_histories", {})
+
+            # Retain the fitted NN params per model so plot_predicted_trajectories.py can
+            # forward-integrate test trajectories from the JSON without retraining.
+            trained_params = {
+                m: extract_trained_params(m, model)
+                for m, model in res.get("trained_models", {}).items()
+            }
+
             out["results"][str(B)] = {
                 "B": B,
                 "train_batch_ids": res.get("train_batch_ids"),
                 "test_batch_ids": res.get("test_batch_ids"),
-                "train_runtimes": runtimes,
+                "train_runtimes": train_runtimes,
                 "final_mses": final_mses,
+                "mse_histories": mse_histories,
+                "residual_histories": residual_histories,
+                "objective_histories": objective_histories,
+                "trained_params": trained_params,
             }
         except Exception as e:  # keep the sweep alive; record the failure for this B
             out["results"][str(B)] = {"B": B, "error": f"{type(e).__name__}: {e}"}
@@ -163,10 +120,15 @@ def main():
         save()
         print(f" [saved results through B={B}]")
 
-    plot(out, WALLCLOCK_PLOT_PATH)
-    plot_test_mse(out, MSE_PLOT_PATH)
-    print(f"\nSweep complete. Results in {RESULTS_PATH}")
+    print(f"\nSweep complete. Results in {args.results_path}")
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--data-path", type=str, required=True,
+                        help="Path to the CSV data file to train on.")
+    parser.add_argument("--results-path", type=Path, required=True,
+                        help="Path to write the results .json (parent dirs created as needed).")
+    args = parser.parse_args()
+
     main()

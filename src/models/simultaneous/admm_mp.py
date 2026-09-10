@@ -1,4 +1,6 @@
-'''multiprocessing wrapper to organize NODEPyomo submodels for ADMM-based batched training.'''
+'''
+multiprocessing wrapper to organize NODEPyomo submodels for ADMM-based batched training.
+'''
 import os
 for thread_var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
     os.environ.setdefault(thread_var, "1")
@@ -29,7 +31,7 @@ def solve_worker(payload: dict):
             payload["dual_var_Ws"][WORKER.worker_id],
             payload["dual_var_bs"][WORKER.worker_id],
             payload["iteration_count"],
-            payload["admm_penalty_param"]
+            payload["admm_penalty_param"],
         )
         WORKER.solve_submodel(payload["solver_options"])
         return (WORKER.worker_id, WORKER.submodel_Ws, WORKER.submodel_bs,
@@ -54,7 +56,6 @@ class MPWorker:
     def __init__(self, worker_id: int, submodel_config: dict):
         self.worker_id = worker_id
         self.layer_sizes = submodel_config['layer_sizes']
-
         self.submodel = NODEPyomo(
             Y_obs=submodel_config['Y_obs'][worker_id],
             layer_sizes=self.layer_sizes,
@@ -63,15 +64,14 @@ class MPWorker:
             state_upper_bound=submodel_config['state_upper_bound'],
             param_lower_bound=submodel_config['param_lower_bound'],
             param_upper_bound=submodel_config['param_upper_bound'],
+            obs_times=submodel_config['obs_times'],
             l2_reg_param=submodel_config['l2_reg_param'],
             admm_submodel=True,
             admm_penalty_param=submodel_config['admm_penalty_param'],
             transcription_method=submodel_config['transcription_method'],
             irrdc_param=submodel_config['irrdc_param'],
-            num_res_eval_nodes=submodel_config['num_res_eval_nodes'],
-            obs_times=submodel_config['obs_times']
+            num_res_eval_nodes=submodel_config['num_res_eval_nodes']
         )
-
         self.submodel_obj = float("nan")  # final subproblem objective, refreshed each solve
         self.submodel_local_dc_obj = float("nan")  # final subproblem objective without ADMM penalty, refreshed each solve
 
@@ -121,7 +121,6 @@ class MPWorker:
 
         # final objective from this ipopt solve (NaN if no usable solution was loaded)
         self.submodel_obj = self.submodel.last_solve_info["objective"]
-        self.submodel_local_dc_obj = self.submodel.last_solve_info["local_dc_objective"]
 
     def broadcast_consensus_and_duals(self,
             consensus_Ws: list, consensus_bs: list,
@@ -130,6 +129,7 @@ class MPWorker:
             admm_penalty_param: float,
             warm_init: bool = False,
             warm_init_submodel_Ws: list = None, warm_init_submodel_bs: list = None
+            #relaxed_submodels_Ws: list = None, relaxed_submodels_bs: list = None
     ):
         # broadcast the current penalty parameter rho into the submodel objective (mutable Param)
         self.submodel.model.admm_penalty_param.set_value(admm_penalty_param)
@@ -144,6 +144,12 @@ class MPWorker:
             if iteration_count > 50: 
                 self.submodel.model.Ws[l].W.set_values(self.ndarray_to_dict(consensus_Ws[l-1]))
                 self.submodel.model.bs[l].b.set_values(self.ndarray_to_dict(consensus_bs[l-1]))
+
+            '''# warm-start from this subproblem's previous relaxed params θ̂_b (falls back to its own
+            # previous solve while relaxation is inactive, since relaxed_submodels_* == submodels_* there)
+            if relaxed_submodels_Ws is not None and iteration_count > 50:
+                self.submodel.model.Ws[l].W.set_values(self.ndarray_to_dict(relaxed_submodels_Ws[l-1]))
+                self.submodel.model.bs[l].b.set_values(self.ndarray_to_dict(relaxed_submodels_bs[l-1]))'''
 
             # warm init submodel from b=0 submodel params
             if warm_init:
@@ -208,15 +214,14 @@ class ADMM:
             state_lower_bound: float, state_upper_bound: float,
             param_lower_bound: float, param_upper_bound: float,
             l2_reg_param: float,
-            adaptive_penalty_update: bool = True,
-            fixed_admm_penalty_param: float = None, # if no adaptive update, use this fixed value for ρ
-            use_pool: bool = False,
+            obs_times: np.ndarray = None,
+            use_pool: bool = True,
             warm_init: bool = True,
+            adaptive_penalty_update: bool = True,
+            adaptive_tol_update: bool = True, 
             transcription_method: str = 'dc',
             irrdc_param: float = None,
-            num_res_eval_nodes: int = None,
-            obs_times: np.ndarray = None,
-            adaptive_tol_update: bool = True
+            num_res_eval_nodes: int = None
     ):
         self.Y_obs = Y_obs # ndarray (num_batches, batch_size, state_dim)
         self.num_batches, self.batch_size, self.state_dim = self.Y_obs.shape
@@ -233,12 +238,7 @@ class ADMM:
         self.param_upper_bound = param_upper_bound
         self.l2_reg_param = l2_reg_param
         self.adaptive_penalty_update = adaptive_penalty_update
-        if self.adaptive_penalty_update:
-            self.admm_penalty_param = np.sqrt(self.num_batches/2)  # initial rho, adapted each ADMM iteration
-        else:
-            if fixed_admm_penalty_param is None:
-                raise ValueError("Must set fixed_admm_penalty_param when adaptive_penalty_update=False.")
-            self.admm_penalty_param = fixed_admm_penalty_param
+        self.admm_penalty_param = np.sqrt(self.num_batches)  # initial rho for adpative or fixed penalty
         self.use_pool = use_pool
         self.transcription_method = transcription_method
         self.irrdc_param = irrdc_param
@@ -255,7 +255,10 @@ class ADMM:
             self.submodels_bs = [[None for _ in range(len(self.layer_sizes) - 1)] for _ in range(self.num_batches)]
 
         self.submodels_obj = [float("nan") for _ in range(self.num_batches)] # final subproblem objective, overwritten each solve
-        self.submodels_local_dc_obj = [float("nan") for _ in range(self.num_batches)]  # final subproblem objective without ADMM penalty, overwritten each solve
+        # per-batch primal used in the dual update: raw solves for mean/loss-weighted, relaxed θ̂ for under-relaxed
+        self.relaxed_submodels_Ws = self.submodels_Ws
+        self.relaxed_submodels_bs = self.submodels_bs
+
         submodel_config = {
             'Y_obs': Y_obs,
             'layer_sizes': layer_sizes,
@@ -286,29 +289,23 @@ class ADMM:
             self.workers = [MPWorker(i, submodel_config) for i in range(self.num_batches)] 
             self.pool_manager = None
 
+        # per-iteration training metric recording
         self.mse_history = {
             "time_min": [],
             "train_mse": [], "train_mse_std": [],
             "test_mse": [], "test_mse_std": [],
         }
-
-        # per-iteration ADMM residual / penalty tracking
         self.residual_history = {
             "primal_avg": [],
-            "primal_per_batch": [], # list[np.ndarray]: per-subproblem primal residual each iter
+            "primal_per_batch": [], # list[np.ndarray]: per-subproblem primal residual 
             "dual": [],
             "rho": [],
-            "eps_pri": [], # adaptive Boyd primal tolerance each iter
-            "eps_dual": [] # adaptive Boyd dual tolerance each iter
+            "eps_pri": [], # adaptive Boyd primal tolerance 
+            "eps_dual": [] # adaptive Boyd dual tolerance 
         }
-
-        # per-iteration per-subproblem final objective tracking (same format as residual_history)
         self.objective_history = {
-            "obj_per_batch": [],       # list[list]: per-subproblem final objective each iter
-            "local_dc_obj_per_batch": [], # list[list]: per-subproblem final objective without ADMM penalty each iter
-            "consensus_weights": [],   # list[list]: per-batch consensus-aggregation weight each iter
+            "obj_per_batch": []       # list[list]: per-subproblem final objective
         }
-
         self.train_runtime = 0
 
     # ----------------- ADMM INITIALISATION METHODS -------------------
@@ -332,9 +329,9 @@ class ADMM:
             obs_times=self.obs_times
         )
         solver_options = {
-            "max_iter": 1000,
-            "tol": 1e-7,
-            "acceptable_tol": 1e-6,
+            "max_iter": 500,
+            "tol": 1e-6,
+            "acceptable_tol": 1e-5,
             "acceptable_iter": 15,
         }
         warmup_model.solve_model(solver_options)
@@ -361,7 +358,7 @@ class ADMM:
         return dual_var_Ws, dual_var_bs
 
 
-    # ------------ SUBMODEL SOLVE METHODS -----------------
+    # ------------------- SUBMODEL SOLVE METHODS --------------------
 
     def solve_submodels_sequential(self, solver_options: dict, iteration_count: int):
         for i in range(self.num_batches):
@@ -369,13 +366,12 @@ class ADMM:
                 self.consensus_Ws, self.consensus_bs,
                 self.dual_var_Ws[i], self.dual_var_bs[i],
                 iteration_count,
-                self.admm_penalty_param
+                self.admm_penalty_param,
             )
             self.workers[i].solve_submodel(solver_options)
             self.submodels_Ws[i] = self.workers[i].submodel_Ws
             self.submodels_bs[i] = self.workers[i].submodel_bs
             self.submodels_obj[i] = self.workers[i].submodel_obj
-            self.submodels_local_dc_obj[i] = self.workers[i].submodel_local_dc_obj
 
     def solve_submodels_parallel(self, solver_options: dict, iteration_count: int):
         payload = {
@@ -385,14 +381,13 @@ class ADMM:
             "dual_var_bs": self.dual_var_bs,
             "solver_options": solver_options,
             "iteration_count": iteration_count,
-            "admm_penalty_param": self.admm_penalty_param
+            "admm_penalty_param": self.admm_penalty_param,
         }
         results = self.pool_manager.map(payload)
         for worker_id, submodel_Ws, submodel_bs, submodel_obj, submodel_local_dc_obj in results:
             self.submodels_Ws[worker_id] = submodel_Ws
             self.submodels_bs[worker_id] = submodel_bs
             self.submodels_obj[worker_id] = submodel_obj
-            self.submodels_local_dc_obj[worker_id] = submodel_local_dc_obj
 
 
     # --------------- ADMM UPDATE METHODS -------------------
@@ -414,64 +409,72 @@ class ADMM:
 
         return old_consensus_Ws, old_consensus_bs
 
-    def update_consensus_params_lossweighted(self, beta: float = 0.5):
+    def update_consensus_params_relaxed(self, alpha: float = 0.7):
         '''
-        Update consensus params by loss-weighted averaging submodel params, using a softmax
-        over each subproblem's unpenalised (local DC) objective. Failed solves (NaN objective)
-        get weight 0; if every submodel failed, falls back to mean aggregation.
-        Returns (weights, old_consensus_Ws, old_consensus_bs).
-        '''
-        # convert submodel objectives (unpenalised) to weights (lower obj -> higher weight)
-        obj_array = np.nan_to_num(np.array(self.submodels_local_dc_obj), nan=np.inf) # replace NaN with +inf so that failed solves get weight 0
-        if np.all(np.isinf(obj_array)):
-            # all submodels failed to solve => fallback to mean aggregation (uniform weights)
-            print("All submodels failed to solve; falling back to mean consensus aggregation.")
-            old_consensus_Ws, old_consensus_bs = self.update_consensus_params_mean()
-            uniform_weights = np.full(self.num_batches, 1.0 / self.num_batches)
-            return uniform_weights, old_consensus_Ws, old_consensus_bs
-        weights = np.exp(-beta * obj_array) # exp(-β*obj) to ensure positivity
-        weights /= np.sum(weights) # normalize to sum to 1
+        Boyd relaxation. The relaxed primal θ̂^k_b = α*θ^k_b + (1-α)*Θ^{k-1}_consensus is used in
+        BOTH the consensus mean update and the dual update. 
 
+        α<1 = under-relaxation (spike damping);
+        α>1 = over-relaxation (acceleration); 
+        α=1 = plain mean. 
+
+        Returns (uniform weights, old_consensus_Ws, old_consensus_bs).
+        '''
         old_consensus_Ws = [w.copy() for w in self.consensus_Ws]
         old_consensus_bs = [b.copy() for b in self.consensus_bs]
 
-        self.consensus_Ws = [
-            sum(weights[b] * self.submodels_Ws[b][l] 
-            for b in range(self.num_batches)) 
-            for l in range(len(self.layer_sizes) - 1)
+        # relaxed per-batch params θ̂_b (self.submodels_* stay the raw solve, used for the residuals)
+        self.relaxed_submodels_Ws = [
+            [alpha * self.submodels_Ws[b][l] + (1.0 - alpha) * old_consensus_Ws[l]
+            for l in range(len(self.layer_sizes) - 1)]
+            for b in range(self.num_batches)
         ]
-        self.consensus_bs = [
-            sum(weights[b] * self.submodels_bs[b][l] 
-            for b in range(self.num_batches)) 
-            for l in range(len(self.layer_sizes) - 1)   
+        self.relaxed_submodels_bs = [
+            [alpha * self.submodels_bs[b][l] + (1.0 - alpha) * old_consensus_bs[l]
+            for l in range(len(self.layer_sizes) - 1)]
+            for b in range(self.num_batches)
         ]
 
-        return weights, old_consensus_Ws, old_consensus_bs
+        # consensus = mean of relaxed submodel params
+        self.consensus_Ws = [w.copy() for w in self.relaxed_submodels_Ws[0]]
+        self.consensus_bs = [b.copy() for b in self.relaxed_submodels_bs[0]]
+        for b in range(1, self.num_batches):
+            for l in range(len(self.layer_sizes) - 1):
+                self.consensus_Ws[l] += self.relaxed_submodels_Ws[b][l]
+                self.consensus_bs[l] += self.relaxed_submodels_bs[b][l]
+        for l in range(len(self.layer_sizes) - 1):
+            self.consensus_Ws[l] /= self.num_batches
+            self.consensus_bs[l] /= self.num_batches
 
-    def update_consensus_params(self, consensus_aggregator: str, iteration_count: int,
-            lossweighted_start_iter: int = 150):
-        '''
-        Dispatch to the chosen consensus aggregation. Loss-weighting is delayed until the run
-        has settled (iteration_count > lossweighted_start_iter); before that point, and for the
-        "mean" aggregator, plain mean aggregation is used. Always returns
-        (weights, old_consensus_Ws, old_consensus_bs) so the caller never has to branch;
-        weights are uniform (1/B) whenever mean aggregation is used.
-        '''
-        if consensus_aggregator == "loss-weighted" and iteration_count > lossweighted_start_iter:
-            return self.update_consensus_params_lossweighted()
-        old_consensus_Ws, old_consensus_bs = self.update_consensus_params_mean()
-        weights = np.full(self.num_batches, 1.0 / self.num_batches)
-        return weights, old_consensus_Ws, old_consensus_bs
+        return old_consensus_Ws, old_consensus_bs
+
+    def update_consensus_params(self, 
+            consensus_aggregator: str, 
+            iteration_count: int,
+            relaxation_start_iter: int = 50
+    ):
+        '''Dispatch to the chosen consensus aggregation'''
+        # default: the dual update uses the raw solves (overridden by the relaxed path)
+        self.relaxed_submodels_Ws = self.submodels_Ws
+        self.relaxed_submodels_bs = self.submodels_bs
+        if consensus_aggregator == "under-relaxed" and iteration_count > relaxation_start_iter:
+            return self.update_consensus_params_relaxed()
+        else:
+            return self.update_consensus_params_mean()
 
     def update_dual_vars(self):
-        '''Update dual variables for each subproblem. Call after update_consensus_params.'''
+        '''
+        Update dual variables for each subproblem. Call after update_consensus_params.
+        Uses self.relaxed_submodels_* (the raw solves for mean/loss-weighted; the relaxed θ̂ for
+        under-relaxed) so the dual variable retains zero sum.
+        '''
         for b in range(self.num_batches):
             for l in range(len(self.layer_sizes) - 1):
                 self.dual_var_Ws[b][l] += (
-                    self.admm_penalty_param * (self.submodels_Ws[b][l] - self.consensus_Ws[l])
+                    self.admm_penalty_param * (self.relaxed_submodels_Ws[b][l] - self.consensus_Ws[l])
                 )
                 self.dual_var_bs[b][l] += (
-                    self.admm_penalty_param * (self.submodels_bs[b][l] - self.consensus_bs[l])
+                    self.admm_penalty_param * (self.relaxed_submodels_bs[b][l] - self.consensus_bs[l])
                 )
 
     def compute_primal_residual(self):
@@ -628,7 +631,7 @@ class ADMM:
             num_early_iterations: int = 10,
             near_stopping_band: float = 1.5,
             num_convergence_confirmations: int = 3,
-            consensus_aggregator: str = "loss-weighted", # "mean" | "loss-weighted"
+            consensus_aggregator: str = "mean", # "mean" | "under-relaxed"
             training_clock_budget: float = None,
             mse_eval_options: dict = None
     ):
@@ -644,7 +647,7 @@ class ADMM:
                     self.admm_penalty_param = self.update_admm_penalty_param(
                         self.admm_penalty_param, r_primal, s_dual
                     )
-                # adaptive Boyd tolerances from the CURRENT iterate (submodels / consensus / duals)
+                    
                 eps_pri = self.update_primal_stopping_condition(
                     admm_abs_tol, admm_rel_tol,
                     self.submodels_Ws, self.submodels_bs, self.consensus_Ws, self.consensus_bs)
@@ -659,7 +662,7 @@ class ADMM:
                     self.solve_submodels_parallel(solver_options, iteration_count)
                 else:
                     self.solve_submodels_sequential(solver_options, iteration_count)
-                consensus_weights, old_consensus_Ws, old_consensus_bs = self.update_consensus_params(
+                old_consensus_Ws, old_consensus_bs = self.update_consensus_params(
                     consensus_aggregator, iteration_count
                 )
                 self.update_dual_vars()
@@ -668,8 +671,7 @@ class ADMM:
 
                 # per-subproblem final objective (with and without ADMM penalty)
                 obj_per_batch = np.array([self.submodels_obj[b] for b in range(self.num_batches)])
-                local_dc_obj_per_batch = np.array([self.submodels_local_dc_obj[b] for b in range(self.num_batches)])
-
+            
                 iteration_count += 1
 
                 # record per-iteration residuals and the penalty parameter used this iteration
@@ -682,20 +684,14 @@ class ADMM:
                 self.residual_history["eps_pri"].append(float(eps_pri))
                 self.residual_history["eps_dual"].append(float(eps_dual))
                 self.objective_history["obj_per_batch"].append(obj_per_batch.tolist())
-                self.objective_history["local_dc_obj_per_batch"].append(local_dc_obj_per_batch.tolist())
-                self.objective_history["consensus_weights"].append(consensus_weights.tolist())
 
                 print(f"Primal residual: {r_primal:.6f} (eps_pri {eps_pri:.6f})")
                 print(f"Dual residual: {s_dual:.6f} (eps_dual {eps_dual:.6f})")
-                print(f"Penalty param rho: {self.admm_penalty_param:.4g}")
+                print(f"rho: {self.admm_penalty_param:.4g}")
                 print("Per-batch primal residuals: "
                       + np.array2string(r_primal_per_batch, precision=4, max_line_width=np.inf))
                 print("Per-batch subproblem objective: "
                       + np.array2string(obj_per_batch, precision=4, max_line_width=np.inf))
-                print("Per-batch subproblem objective without ADMM penalty: "
-                      + np.array2string(local_dc_obj_per_batch, precision=4, max_line_width=np.inf))
-                print("Per-batch consensus weights: "
-                      + np.array2string(consensus_weights, precision=4, max_line_width=np.inf))
 
                 t_start += time.perf_counter() - t_res0  # exclude residual calculation from timer
 

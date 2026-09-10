@@ -2,15 +2,12 @@
 Parent method for running batched NODE training on a set of multiple, independent
 trajectories, with three interchangeable training algorithms:
 
-  - ADMM-based consensus collocation model (Pyomo/IPOPT, DC)        -> method key 'dc'
-  - sequential Neural ODE baseline (PyTorch / torchdiffeq)          -> method key 'seq'
-  - monolithic collocation model (Pyomo/IPOPT, block-diagonal DC)   -> method key 'mono'
+-- ADMM-based consensus collocation model (Pyomo/IPOPT, DC)        -> method key 'admm'
+-- sequential Neural ODE baseline (PyTorch / torchdiffeq)          -> method key 'seq'
+-- monolithic collocation model (Pyomo/IPOPT, block-diagonal DC)   -> method key 'mono'
 
-main() trains each enabled model on the SAME train/test split and RETURNS the per-model
-wall-clock training times (and MSE histories), so a sweep driver
-(run_scaling_sweep.py) can compare them across training-set sizes.
-
-Run from repo root with 'python -m data.bioreactor_simulation.training_run'.
+main() trains each enabled model on the same train/test split and returns the per-model
+wall-clock training times, MSE histories and residuals. 
 """
 import time
 import numpy as np
@@ -21,34 +18,41 @@ from src.models.simultaneous.admm_mp import ADMM
 from src.models.simultaneous.node_pyomo_monolithic import NODEPyomo as MonolithicNODEPyomo
 from src.models.sequential.node_torch_multitraj import train_sequential_multitraj
 
-def training_run(
+def run_training(
     data_path: str,
     state_cols: list,
     nn_layer_sizes: list,
     num_train_trajectories: int,
-    num_test_trajectories: int = 5,
+    num_test_trajectories: int,
+    seed: int,
     run_admm_baseline: bool = True,
     run_sequential_baseline: bool = False,
     run_monolithic_baseline: bool = True,
-    seed: int = None
+    return_models: bool = True
 ) -> dict:
     """
-    Train the enabled models on one train/test split and return their runtimes.
+    Train the models on one train/test split and return their metrics.
 
     Args:
         seed: seeds the train/test split (and the torch baseline) for reproducibility.
 
     Returns:
         dict {
-          'train_runtimes': {method: wall_clock_seconds}, # methods that ran
-          'mse_histories':  {method: history dict}, # 'dc' / 'seq' only
-          'train_batch_ids': [...], 'test_batch_ids': [...],
+          'train_batch_ids': [...],
+          'test_batch_ids': [...],
+          'train_runtimes': {method: wall_clock_seconds},
+          'mse_histories':  {method: {train_mse: [...], test_mse: [...], ...}},
+          'residual_histories': {admm: {primal_avg: [...], dual: [...], rho: [...], ...}},
+          'objective_histories': {admm: {obj_per_batch: [...], ...}},
+          'final_mses': {method: (final_train_mse, final_test_mse)},
+          # the following are added only when return_models=True:
+          'trained_models': {method: fitted model object},
+          'test_grid': [...], 'Y_test_obs': ndarray, 'train_grid': [...], 'Y_obs': ndarray,
         }
     """
     print(f"Using layer sizes: {nn_layer_sizes} (num_train={num_train_trajectories}, num_test={num_test_trajectories})")
 
     rng = np.random.default_rng(seed)
-
 
     # -------------------- SETUP --------------------
     df = pd.read_csv(data_path)
@@ -70,7 +74,7 @@ def training_run(
     Y_test_obs = np.array([test_batches[bid][state_cols].values for bid in test_batch_ids]) # (num_test, N, D)
     end_time = train_grid[-1]
 
-    # per-iteration MSE recording for the ADMM consensus model
+    # per-iteration training metric recording 
     dt = train_grid[1] - train_grid[0]
     mse_eval_options = {
         "train_grid": train_grid,
@@ -81,13 +85,15 @@ def training_run(
         "atol": 1e-9,
         "max_step": dt,
     }
-
-    train_runtimes = {} # {method: training wall-clock seconds}
+    train_runtimes = {}
     mse_histories = {}
-    final_mses = {} # {method: (final_train_mse, final_test_mse)} after convergence / budget elapsed
+    residual_histories = {}
+    final_mses = {}
+    objective_histories = {}
+    trained_models = {}
     method_labels = {
         'mono': 'monolithic (DC)',
-        'dc': 'ADMM consensus (DC)',
+        'admm': 'ADMM consensus (DC)',
         'seq': 'sequential (torchdiffeq)',
     }
 
@@ -104,9 +110,9 @@ def training_run(
         }
         # standard tolerances for the remaining ADMM iterations
         admm_late_solver_options = {
-            "max_iter": 300,
+            "max_iter": 500,
             "tol": 1e-6,
-            "acceptable_tol": 1e-4,
+            "acceptable_tol": 1e-5,
             "acceptable_iter": 15,
         }
         admm_config = dict(
@@ -119,9 +125,10 @@ def training_run(
             param_lower_bound=-50,
             param_upper_bound=50,
             l2_reg_param=1e-4,
-            adaptive_penalty_update=True,       # adapt rho each iteration via residual balancing
-            fixed_admm_penalty_param=None,      # only used when adaptive_penalty_update=False
             use_pool=True,
+            warm_init=True,
+            adaptive_penalty_update=True, 
+            adaptive_tol_update=True,     
             transcription_method='dc',
             irrdc_param=None,                        
             num_res_eval_nodes=None                  
@@ -131,22 +138,26 @@ def training_run(
             early_solver_options=admm_early_solver_options,
             late_solver_options=admm_late_solver_options,
             admm_abs_tol=3e-3,   # ε_abs (per-parameter absolute floor)
-            admm_rel_tol=3e-4,   # ε_rel (Boyd-recommended 1e-3..1e-4)
+            admm_rel_tol=5e-4,   # ε_rel (Boyd-recommended 1e-3..1e-4)
             max_admm_iterations=500,
             num_early_iterations=10, # opening iters using early_solver_options
             num_convergence_confirmations=3, # consecutive sub-tol iters before stopping (Boyd: 1)
             near_stopping_band=1.5,  # early stop when residuals sit within this x eps
-            training_clock_budget=30, # minutes; None = no wall-clock cap
-            consensus_aggregator="loss-weighted", # ADMM iteration frequency to check convergence
+            training_clock_budget=60, # minutes; None = no wall-clock cap
+            consensus_aggregator="under-relaxed", # ADMM iteration frequency to check convergence
             mse_eval_options=mse_eval_options
         )
         print("\n\nTraining ADMM consensus model (DC) ...\n\n")
         admm = ADMM(**admm_config)
         admm.run_admm_training(**admm_training_options)
-        train_runtimes['dc'] = admm.train_runtime
-        mse_histories['dc'] = admm.mse_history
-        final_mses['dc'] = (admm.mse_history['train_mse'][-1], admm.mse_history['test_mse'][-1])
-        print(f"{method_labels['dc']} training time: {train_runtimes['dc']:.1f}s")
+        train_runtimes['admm'] = admm.train_runtime
+        mse_histories['admm'] = admm.mse_history
+        residual_histories['admm'] = admm.residual_history
+        objective_histories['admm'] = admm.objective_history
+        final_mses['admm'] = (admm.mse_history['train_mse'][-1], admm.mse_history['test_mse'][-1])
+        if return_models:
+            trained_models['admm'] = admm
+        print(f"{method_labels['admm']} training time: {train_runtimes['admm']:.1f}s")
 
 
     # ---------------- 2. Sequential Neural ODE baseline (PyTorch) ----------------
@@ -170,7 +181,7 @@ def training_run(
             Y_obs_test=Y_test_t,
             test_grid=test_grid_t,
             record_mse_every=10,
-            time_budget_min=30, # minutes; None = no wall-clock cap
+            time_budget_min=60, # minutes; None = no wall-clock cap
             solver_method="dopri5",
             rtol=1e-3,
             atol=1e-6,
@@ -191,7 +202,7 @@ def training_run(
         monolithic_solver_options = {
             "max_iter": 1000,
             "tol": 1e-6,
-            "acceptable_tol": 1e-4,
+            "acceptable_tol": 1e-5,
             "acceptable_iter": 15
         }
         print("\n\nTraining monolithic Pyomo baseline ...\n\n")
@@ -219,6 +230,8 @@ def training_run(
             rtol=mse_eval_options['rtol'], atol=mse_eval_options['atol'], max_step=mse_eval_options['max_step']
         )
         final_mses['mono'] = (mono_train_mse, mono_test_mse)
+        if return_models:
+            trained_models['mono'] = mono
         print(f"{method_labels['mono']} training time: {train_runtimes['mono']:.1f}s")
 
 
@@ -229,17 +242,29 @@ def training_run(
     print("Final MSE = model MSE after convergence or wall-clock budget elapsed")
     print("-" * 92)
     print(f"{'Method':<32}{'Train (s)':>12}{'Final train MSE':>22}{'Final test MSE':>22}")
-    for m in ('mono', 'dc', 'seq'):
+    for m in ('mono', 'admm', 'seq'):
         if m in train_runtimes:
             train_mse, test_mse = final_mses.get(m, (float('nan'), float('nan')))
             print(f"{method_labels[m]:<32}{train_runtimes[m]:>12.2f}{train_mse:>22.6e}{test_mse:>22.6e}")
     print("=" * 92 + "\n")
 
-    return {
-        "train_runtimes": train_runtimes,
-        "mse_histories": mse_histories,
-        "final_mses": final_mses,
+    result = {
         "train_batch_ids": train_batch_ids,
         "test_batch_ids": test_batch_ids,
+        "train_runtimes": train_runtimes,
+        "mse_histories": mse_histories,
+        "residual_histories": residual_histories,
+        "final_mses": final_mses,
+        "objective_histories": objective_histories,
     }
+    
+    if return_models:
+        # fitted model objects + the arrays needed to plot predicted vs true trajectories
+        result["trained_models"] = trained_models
+        result["test_grid"] = test_grid
+        result["Y_test_obs"] = Y_test_obs
+        result["train_grid"] = train_grid
+        result["Y_obs"] = Y_obs
+
+    return result
 

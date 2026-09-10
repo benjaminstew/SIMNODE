@@ -193,7 +193,7 @@ class FedBatchSim:
         feed_amount_range: tuple[float, float] = (0.5, 2.0),
         possible_feed_times: np.ndarray | None = None,
         with_feed: bool = True,
-        eps: float = 0.025,
+        eps: float = 0.0,
     ) -> pd.DataFrame:
         """
         Simulate fed-batch bioreactor with variable feed schedules per batch.
@@ -276,3 +276,34 @@ class FedBatchSim:
         result[numeric_cols] = result[numeric_cols].astype("double")
 
         return result
+
+
+if __name__ == "__main__":
+    import os
+
+    # Match the format of the existing raw_data CSVs:
+    #   - 30 time points per batch (Delta t = 1/29 over [0, 1])
+    #   - no feeds (with_feed=False -> no G_Feed column, exactly 30 rows/batch)
+    #   - trailing Noise_Level_ID and Noise_Level columns
+    N_BATCH = 200
+    N_TIME_POINTS = 30
+    NOISE_LEVEL_ID = 1
+    EPS = 0.0  # lowest noise setting
+
+    out_dir = os.path.dirname(os.path.abspath(__file__))
+    out_path = os.path.join(
+        out_dir, f"noise_level_{NOISE_LEVEL_ID:02d}_eps{EPS}_n{N_BATCH}.csv"
+    )
+
+    sim = FedBatchSim()  # no seed -> output differs each run
+    df = sim.simulate(
+        n_batch=N_BATCH,
+        n_time_points=N_TIME_POINTS,
+        with_feed=False,
+        eps=EPS,
+    )
+    df["Noise_Level_ID"] = NOISE_LEVEL_ID
+    df["Noise_Level"] = EPS
+
+    df.to_csv(out_path, index=False)
+    print(f"Wrote {len(df)} rows ({N_BATCH} batches) to {out_path}")
