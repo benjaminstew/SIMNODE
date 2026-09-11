@@ -36,7 +36,6 @@ MODEL_COLOURS = {'mono': '#c87878', 'admm': '#6e96c8'}
 # Tight integration tolerances for prediction (match the training MSE eval).
 PRED_OPTIONS = dict(method='RK45', rtol=1e-7, atol=1e-9)
 
-
 def nn_rhs(t, y, Ws, bs):
     """Standalone tanh-MLP RHS, identical to the models' nn_prediction(t, y, Ws, bs)."""
     out = np.tanh(np.dot(y.reshape(1, -1), Ws[0]) + bs[0])
@@ -45,13 +44,11 @@ def nn_rhs(t, y, Ws, bs):
     out = np.dot(out, Ws[-1]) + bs[-1]
     return out.flatten()
 
-
 def load_params(model_params):
     """Turn the JSON {'Ws': [...], 'bs': [...]} nested lists into arrays."""
     Ws = [np.asarray(W, dtype=float) for W in model_params["Ws"]]
     bs = [np.asarray(b, dtype=float) for b in model_params["bs"]]
     return Ws, bs
-
 
 def predict(Ws, bs, y0, t_grid):
     """Forward-integrate the fitted NN; return (N, D) prediction or None on failure."""
@@ -65,7 +62,6 @@ def predict(Ws, bs, y0, t_grid):
         return None
     return sol.y.T
 
-
 def parse_args():
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -75,7 +71,7 @@ def parse_args():
         help="Path to the scaling-sweep .json produced by run_scaling_sweep.py.",
     )
     parser.add_argument(
-        "--plots-path", type=Path, default=None,
+        "--plots-path", type=Path, default="./data/bioreactor_simulation",
         help="Directory to write the PNG into (default: same directory as --results-path).",
     )
     parser.add_argument(
@@ -83,7 +79,7 @@ def parse_args():
         help="Which training-set size B in the sweep to plot (must exist in the JSON).",
     )
     parser.add_argument(
-        "--test-index", type=int, default=0,
+        "--test-index", type=int, default=5,
         help="Which test trajectory to plot (0-based, into that B's test_batch_ids).",
     )
     parser.add_argument(
@@ -98,7 +94,6 @@ def parse_args():
         args.plots_path = args.results_path.parent
     args.plots_path.mkdir(parents=True, exist_ok=True)
     return args
-
 
 def main():
     args = parse_args()
@@ -158,7 +153,7 @@ def main():
     if batch_df.empty:
         raise SystemExit(f"Batch_{test_bid} not found in {data_path}.")
     t_grid = batch_df['Time'].values
-    true_traj = batch_df[state_cols].values      # (N, D)
+    true_traj = batch_df[state_cols].values # (N, D)
     y0 = true_traj[0]
 
     print(f"Plotting B={args.B}, test Batch_{test_bid} (test index {ti}); "
@@ -198,7 +193,6 @@ def main():
     else:
         fig.legend(handles, labels, loc="lower center", ncol=len(labels))
 
-    fig.suptitle(f"Predicted vs true trajectory (B={args.B}, test Batch_{test_bid})", fontsize=13)
     fig.tight_layout(rect=(0, 0, 1, 0.97))
 
     model_tag = "-".join(models_to_plot)

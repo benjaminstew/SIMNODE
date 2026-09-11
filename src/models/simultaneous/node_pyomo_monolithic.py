@@ -422,31 +422,38 @@ class NODEPyomo:
 
         return predicted_trajectory.y.T
 
-    def compute_prediction_mse(self, 
-            t_grid, 
-            Y_obs, 
-            method='RK45', 
-            rtol=1e-3, 
-            atol=1e-6, 
-            max_step=np.inf
+    def compute_prediction_mse(self,
+            t_grid,
+            Y_obs,
+            method='RK45',
+            rtol=1e-3,
+            atol=1e-6,
+            max_step=np.inf,
+            return_range=False
     ):
         '''
         Mean / std of per-trajectory MSE under the trained network, matching
         ADMM.compute_prediction_mse semantics (per-batch MSE over (time, state), then
-        mean / std across batches). Returns (nan, nan) if any forward solve fails.
+        mean / std across batches). If return_range=True, also returns the (min, max)
+        per-trajectory MSE, i.e. (mean, std, mse_min, mse_max). Returns nan(s) if any
+        forward solve fails.
 
         Args:
             t_grid: (num_nodes,) time grid to integrate / evaluate on.
             Y_obs:  (num_batches, num_nodes, state_dim) reference trajectories (initial
                     conditions taken from Y_obs[:, 0, :]).
         '''
+        nan_out = (np.nan, np.nan, np.nan, np.nan) if return_range else (np.nan, np.nan)
         Y_obs = np.asarray(Y_obs, dtype=float)
         per_batch = []
         for b in range(Y_obs.shape[0]):
             try:
                 pred = self.get_predicted_trajectory(Y_obs[b, 0, :], t_grid, method, rtol, atol, max_step)
             except RuntimeError:
-                return np.nan, np.nan
+                return nan_out
             per_batch.append(np.mean((pred - Y_obs[b]) ** 2))
         per_batch = np.asarray(per_batch, dtype=float)
-        return float(per_batch.mean()), float(per_batch.std())
+        mean, std = float(per_batch.mean()), float(per_batch.std())
+        if return_range:
+            return mean, std, float(per_batch.min()), float(per_batch.max())
+        return mean, std

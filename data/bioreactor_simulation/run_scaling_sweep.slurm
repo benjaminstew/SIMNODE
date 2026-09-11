@@ -20,4 +20,9 @@ export NUMEXPR_NUM_THREADS=1
 export PYTHONUNBUFFERED=1
 
 cd $HOME/CNODE
-python -m data.bioreactor_simulation.run_scaling_sweep
+
+# run_scaling_sweep.py now REQUIRES --data-path and --results-path (paths relative to $HOME/CNODE).
+# Set DATA to the CSV you want to sweep on.
+DATA=data/bioreactor_simulation/raw_data/noise_level_01_eps0.01_n200.csv
+RESULTS=data/bioreactor_simulation/scaling_sweep_results.json
+python -m data.bioreactor_simulation.run_scaling_sweep --data-path="$DATA" --results-path="$RESULTS"

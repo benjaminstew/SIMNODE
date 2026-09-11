@@ -306,6 +306,12 @@ class ADMM:
         self.objective_history = {
             "obj_per_batch": []       # list[list]: per-subproblem final objective
         }
+        # Definitive final metrics at the converged consensus params (set by the final eval at the
+        # end of run_admm_training). Range = (min, max) of per-trajectory final test MSE.
+        self.final_train_mse = float("nan")
+        self.final_test_mse = float("nan")
+        self.final_test_mse_std = float("nan")
+        self.final_test_mse_range = (float("nan"), float("nan"))
         self.train_runtime = 0
 
     # ----------------- ADMM INITIALISATION METHODS -------------------
@@ -583,13 +589,16 @@ class ADMM:
             method: str = 'RK45',
             rtol: float = 1e-3,
             atol: float = 1e-6,
-            max_step: float = np.inf
+            max_step: float = np.inf,
+            return_range: bool = False
     ):
         '''
         MSE between observed trajectories and trajectories predicted
         with the current consensus parameters. The MSE is computed per batch, then
-        the mean and std across batches are returned.
+        the mean and std across batches are returned. If return_range=True, also
+        returns the (min, max) per-trajectory MSE, i.e. (mean, std, mse_min, mse_max).
         '''
+        nan_out = (np.nan, np.nan, np.nan, np.nan) if return_range else (np.nan, np.nan)
         per_batch_mse = []
         for b in range(Y_obs.shape[0]):
             y0 = Y_obs[b, 0, :]
@@ -598,12 +607,15 @@ class ADMM:
                     y0, t_grid, method=method, rtol=rtol, atol=atol, max_step=max_step
                 )
             except RuntimeError:
-                return np.nan, np.nan # unstable params early in training => skip point
+                return nan_out # unstable params early in training => skip point
             per_batch_mse.append(np.mean((pred - Y_obs[b]) ** 2))
         if not per_batch_mse:
-            return np.nan, np.nan
-        
-        return float(np.mean(per_batch_mse)), float(np.std(per_batch_mse))
+            return nan_out
+
+        mean, std = float(np.mean(per_batch_mse)), float(np.std(per_batch_mse))
+        if return_range:
+            return mean, std, float(np.min(per_batch_mse)), float(np.max(per_batch_mse))
+        return mean, std
     
 
     #--------------------------- MAIN ADMM LOOP --------------------------------
@@ -628,12 +640,13 @@ class ADMM:
             max_admm_iterations: int,
             admm_abs_tol: float, # ε_abs
             admm_rel_tol: float, # ε_rel
-            num_early_iterations: int = 10,
-            near_stopping_band: float = 1.5,
-            num_convergence_confirmations: int = 3,
+            num_early_iterations: int = 25,
+            near_stopping_band: float = 1.2,
+            num_convergence_confirmations: int = 2,
             consensus_aggregator: str = "mean", # "mean" | "under-relaxed"
             training_clock_budget: float = None,
-            mse_eval_options: dict = None
+            mse_eval_options: dict = None,
+            mse_eval_every: int = 5  # evaluate + record prediction MSE every N ADMM iterations
     ):
         '''Run the ADMM consensus training loop.'''
         iteration_count = 0
@@ -642,18 +655,17 @@ class ADMM:
         t_start = time.perf_counter()
         try:
             for iteration in range(max_admm_iterations):
-
                 if self.adaptive_penalty_update and iteration_count > 0:
                     self.admm_penalty_param = self.update_admm_penalty_param(
                         self.admm_penalty_param, r_primal, s_dual
-                    )
-                    
+                    )    
                 eps_pri = self.update_primal_stopping_condition(
                     admm_abs_tol, admm_rel_tol,
-                    self.submodels_Ws, self.submodels_bs, self.consensus_Ws, self.consensus_bs)
+                    self.submodels_Ws, self.submodels_bs, self.consensus_Ws, self.consensus_bs
+                )
                 eps_dual = self.update_dual_stopping_condition(
-                    admm_abs_tol, admm_rel_tol, self.dual_var_Ws, self.dual_var_bs)
-                
+                    admm_abs_tol, admm_rel_tol, self.dual_var_Ws, self.dual_var_bs
+                )
                 print(f"ADMM iteration {iteration + 1}")
                 solver_options = self.set_solver_options(
                     early_solver_options, late_solver_options, num_early_iterations, iteration_count
@@ -668,15 +680,13 @@ class ADMM:
                 self.update_dual_vars()
                 r_primal, r_primal_per_batch = self.compute_primal_residual()
                 s_dual = self.compute_dual_residual(old_consensus_Ws, old_consensus_bs)
-
-                # per-subproblem final objective (with and without ADMM penalty)
-                obj_per_batch = np.array([self.submodels_obj[b] for b in range(self.num_batches)])
-            
                 iteration_count += 1
 
-                # record per-iteration residuals and the penalty parameter used this iteration
-                t_res0 = time.perf_counter()
+                # per-subproblem final objective 
+                obj_per_batch = np.array([self.submodels_obj[b] for b in range(self.num_batches)])
 
+                # record per-iteration residuals and the ρ value used this iteration
+                t_res0 = time.perf_counter()
                 self.residual_history["primal_avg"].append(float(r_primal))
                 self.residual_history["primal_per_batch"].append(r_primal_per_batch.tolist())
                 self.residual_history["dual"].append(float(s_dual))
@@ -684,7 +694,6 @@ class ADMM:
                 self.residual_history["eps_pri"].append(float(eps_pri))
                 self.residual_history["eps_dual"].append(float(eps_dual))
                 self.objective_history["obj_per_batch"].append(obj_per_batch.tolist())
-
                 print(f"Primal residual: {r_primal:.6f} (eps_pri {eps_pri:.6f})")
                 print(f"Dual residual: {s_dual:.6f} (eps_dual {eps_dual:.6f})")
                 print(f"rho: {self.admm_penalty_param:.4g}")
@@ -692,19 +701,17 @@ class ADMM:
                       + np.array2string(r_primal_per_batch, precision=4, max_line_width=np.inf))
                 print("Per-batch subproblem objective: "
                       + np.array2string(obj_per_batch, precision=4, max_line_width=np.inf))
-
                 t_start += time.perf_counter() - t_res0  # exclude residual calculation from timer
 
-                # Record wall-clock convergence (prediction MSE) using the current consensus model
-                # Timer is paused for evaluation
-                if mse_eval_options is not None:
+                # Record prediction MSE using the current consensus model,
+                # every `mse_eval_every' iterations. Timer is paused for evaluation.
+                if mse_eval_options is not None and (iteration_count % mse_eval_every == 0):
                     t_mse0 = time.perf_counter()
-
                     pred_kw = {
                         "method": mse_eval_options.get("method", "RK45"),
                         "rtol": mse_eval_options.get("rtol", 1e-3),
                         "atol": mse_eval_options.get("atol", 1e-6),
-                        "max_step": mse_eval_options.get("max_step", np.inf),
+                        "max_step": mse_eval_options.get("max_step", np.inf)
                     }
                     train_mse, train_mse_std = self.compute_prediction_mse(
                         mse_eval_options["Y_obs"], mse_eval_options["train_grid"], **pred_kw
@@ -719,7 +726,6 @@ class ADMM:
                     self.mse_history["test_mse"].append(test_mse)
                     self.mse_history["test_mse_std"].append(test_mse_std)
                     print(f"Train MSE: {train_mse:.6e} | Test MSE: {test_mse:.6e}")
-
                     t_start += time.perf_counter() - t_mse0  # exclude eval cost from timer
 
                 # stop if BOTH residuals sit within `near_stopping_band' for num_convergence_confirmations consecutive iterations.
@@ -747,6 +753,25 @@ class ADMM:
         finally:
             if self.use_pool:
                 self.pool_manager.close()
+
+        # Definitive final MSE eval at using the converged consensus model. So even if the
+        # last in-loop eval was skipped by mse_eval_every, the reported final MSEs sit at the true final params. 
+        if mse_eval_options is not None:
+            pred_kw = {
+                "method": mse_eval_options.get("method", "RK45"),
+                "rtol": mse_eval_options.get("rtol", 1e-3),
+                "atol": mse_eval_options.get("atol", 1e-6),
+                "max_step": mse_eval_options.get("max_step", np.inf),
+            }
+            self.final_train_mse, _ = self.compute_prediction_mse(
+                mse_eval_options["Y_obs"], mse_eval_options["train_grid"], **pred_kw
+            )
+            (self.final_test_mse, self.final_test_mse_std,
+             final_test_min, final_test_max) = self.compute_prediction_mse(
+                mse_eval_options["Y_test_obs"], mse_eval_options["test_grid"],
+                return_range=True, **pred_kw
+            )
+            self.final_test_mse_range = (final_test_min, final_test_max)
 
 
     # ---------------- NODE PREDICTION METHODS --------------------

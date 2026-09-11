@@ -44,7 +44,7 @@ def run_training(
           'mse_histories':  {method: {train_mse: [...], test_mse: [...], ...}},
           'residual_histories': {admm: {primal_avg: [...], dual: [...], rho: [...], ...}},
           'objective_histories': {admm: {obj_per_batch: [...], ...}},
-          'final_mses': {method: (final_train_mse, final_test_mse)},
+          'final_mses': {method: {train, test, test_min, test_max}},  # range = per-test-traj MSE spread
           # the following are added only when return_models=True:
           'trained_models': {method: fitted model object},
           'test_grid': [...], 'Y_test_obs': ndarray, 'train_grid': [...], 'Y_obs': ndarray,
@@ -83,7 +83,7 @@ def run_training(
         "Y_test_obs": Y_test_obs,
         "rtol": 1e-7,
         "atol": 1e-9,
-        "max_step": dt,
+        "max_step": dt
     }
     train_runtimes = {}
     mse_histories = {}
@@ -106,14 +106,14 @@ def run_training(
             "max_iter": 100,
             "tol": 1e-3,
             "acceptable_tol": 1e-2,
-            "acceptable_iter": 5,
+            "acceptable_iter": 5
         }
         # standard tolerances for the remaining ADMM iterations
         admm_late_solver_options = {
             "max_iter": 500,
             "tol": 1e-6,
             "acceptable_tol": 1e-5,
-            "acceptable_iter": 15,
+            "acceptable_iter": 15
         }
         admm_config = dict(
             Y_obs=Y_obs,                   
@@ -137,15 +137,16 @@ def run_training(
         admm_training_options = dict(
             early_solver_options=admm_early_solver_options,
             late_solver_options=admm_late_solver_options,
-            admm_abs_tol=3e-3,   # ε_abs (per-parameter absolute floor)
+            admm_abs_tol=1e-3,   # ε_abs (per-parameter absolute floor)
             admm_rel_tol=5e-4,   # ε_rel (Boyd-recommended 1e-3..1e-4)
             max_admm_iterations=500,
-            num_early_iterations=10, # opening iters using early_solver_options
-            num_convergence_confirmations=3, # consecutive sub-tol iters before stopping (Boyd: 1)
+            num_early_iterations=25, # opening iters using early_solver_options
+            num_convergence_confirmations=2, # consecutive sub-tol iters before stopping (Boyd: 1)
             near_stopping_band=1.5,  # early stop when residuals sit within this x eps
             training_clock_budget=60, # minutes; None = no wall-clock cap
             consensus_aggregator="under-relaxed", # ADMM iteration frequency to check convergence
-            mse_eval_options=mse_eval_options
+            mse_eval_options=mse_eval_options,
+            mse_eval_every=5 # evaluate/record prediction MSE every N ADMM iters (raise to cut eval wall-clock)
         )
         print("\n\nTraining ADMM consensus model (DC) ...\n\n")
         admm = ADMM(**admm_config)
@@ -154,7 +155,13 @@ def run_training(
         mse_histories['admm'] = admm.mse_history
         residual_histories['admm'] = admm.residual_history
         objective_histories['admm'] = admm.objective_history
-        final_mses['admm'] = (admm.mse_history['train_mse'][-1], admm.mse_history['test_mse'][-1])
+        # Final MSEs from the definitive final eval (mean + per-test-trajectory range).
+        final_mses['admm'] = {
+            "train": admm.final_train_mse,
+            "test": admm.final_test_mse,
+            "test_min": admm.final_test_mse_range[0],
+            "test_max": admm.final_test_mse_range[1],
+        }
         if return_models:
             trained_models['admm'] = admm
         print(f"{method_labels['admm']} training time: {train_runtimes['admm']:.1f}s")
@@ -194,7 +201,13 @@ def run_training(
             log_every=50
         )
         train_runtimes['seq'] = time.perf_counter() - t0
-        final_mses['seq'] = (mse_histories['seq']['train_mse'][-1], mse_histories['seq']['test_mse'][-1])
+        # seq baseline records only mean MSEs (no per-trajectory range); keep schema uniform.
+        final_mses['seq'] = {
+            "train": mse_histories['seq']['train_mse'][-1],
+            "test": mse_histories['seq']['test_mse'][-1],
+            "test_min": None,
+            "test_max": None,
+        }
         print(f"{method_labels['seq']} training time: {train_runtimes['seq']:.1f}s")
 
     # ---------------- 3. Monolithic collocation model (block-diagonal DC) ----------------
@@ -225,11 +238,16 @@ def run_training(
             train_grid, Y_obs,
             rtol=mse_eval_options['rtol'], atol=mse_eval_options['atol'], max_step=mse_eval_options['max_step']
         )
-        mono_test_mse, _ = mono.compute_prediction_mse(
-            test_grid, Y_test_obs,
+        mono_test_mse, _, mono_test_min, mono_test_max = mono.compute_prediction_mse(
+            test_grid, Y_test_obs, return_range=True,
             rtol=mse_eval_options['rtol'], atol=mse_eval_options['atol'], max_step=mse_eval_options['max_step']
         )
-        final_mses['mono'] = (mono_train_mse, mono_test_mse)
+        final_mses['mono'] = {
+            "train": mono_train_mse,
+            "test": mono_test_mse,
+            "test_min": mono_test_min,
+            "test_max": mono_test_max,
+        }
         if return_models:
             trained_models['mono'] = mono
         print(f"{method_labels['mono']} training time: {train_runtimes['mono']:.1f}s")

@@ -26,8 +26,8 @@ from data.bioreactor_simulation.run_training import run_training
 # ------------------------------- CONFIG -------------------------------
 STATE_COLS = ['G', 'O', 'X', 'Xd', 'P', 'L', 'CO2']
 NN_LAYER_SIZES = [len(STATE_COLS), 16, len(STATE_COLS)]
-NUM_TEST = 5
-B_MIN, B_MAX = 2, 3 # sweep B = 2 .. 45 training trajectories
+NUM_TEST = 25
+B_MIN, B_MAX = 2, 25 # sweep B = 2 .. 45 training trajectories
 SEED = 0 # fixes the train/test split per B (reproducible)
 
 def extract_trained_params(method: str, model) -> dict:
@@ -55,7 +55,6 @@ def main():
     batch_sizes = list(range(B_MIN, B_MAX + 1))
     print(f"Scaling sweep: B in {batch_sizes}, test set size = {NUM_TEST}")
     print(f"results -> {args.results_path}")
-
     out = {
         "config": {
             "data_path": args.data_path,
@@ -89,7 +88,11 @@ def main():
                 return_models=True 
             )
             train_runtimes = {m: float(t) for m, t in res["train_runtimes"].items()}
-            final_mses = {m: [float(tr), float(te)] for m, (tr, te) in res.get("final_mses", {}).items()}
+            # final_mses[m] = {train, test, test_min, test_max}; test_min/max may be None (e.g. seq).
+            final_mses = {
+                m: {k: (float(v) if v is not None else None) for k, v in d.items()}
+                for m, d in res.get("final_mses", {}).items()
+            }
 
             # The *_history objects are already built as dicts-of-lists => JSON-serialisable
             mse_histories = res.get("mse_histories", {})
@@ -130,5 +133,4 @@ if __name__ == "__main__":
     parser.add_argument("--results-path", type=Path, required=True,
                         help="Path to write the results .json (parent dirs created as needed).")
     args = parser.parse_args()
-
     main()

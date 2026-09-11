@@ -9,19 +9,11 @@ Two families of plot, each individually selectable via --plots:
     walltime_scaling   -> scaling_walltime_vs_batches.png    (wall-clock train time vs B, per model)
 
   Per-B, per-iteration plots — ADMM only, one PNG per selected B:
-    training_loss    -> training_loss_vs_iter_B=<B>.png      (sum of per-batch objective vs iter)
+    training_loss    -> training_loss_vs_iter_B=<B>.png     
     test_mse         -> test_mse_vs_iter_B=<B>.png
     train_mse        -> train_mse_vs_iter_B=<B>.png
-    primal_residual  -> primal_residual_vs_iter_B=<B>.png     (with adaptive eps_pri band)
-    dual_residual    -> dual_residual_vs_iter_B=<B>.png        (with adaptive eps_dual band)
-
-Examples:
-    python -m data.bioreactor_simulation.plot_scaling_sweep \
-        --results-path data/bioreactor_simulation/scaling_sweep_results.json \
-        --plots test_mse_scaling walltime_scaling
-    python -m data.bioreactor_simulation.plot_scaling_sweep \
-        --results-path .../results.json --plots primal_residual dual_residual --batch-sizes 8 20
-    python -m data.bioreactor_simulation.plot_scaling_sweep --results-path .../results.json --plots all
+    primal_residual  -> primal_residual_vs_iter_B=<B>.png     
+    dual_residual    -> dual_residual_vs_iter_B=<B>.png        
 """
 import os
 import json
@@ -88,7 +80,6 @@ def parse_args():
     args.selected = selected
     return args
 
-
 def load_results(results_path):
     with open(results_path) as f:
         data = json.load(f)
@@ -96,11 +87,9 @@ def load_results(results_path):
         raise ValueError(f"No 'results' block found in {results_path}.")
     return data
 
-
 def sorted_B_keys(results):
     """Return the results keys sorted by integer B (skipping malformed ones)."""
     return sorted((k for k in results if str(k).lstrip("-").isdigit()), key=int)
-
 
 def models_present(results):
     """Union of model keys that appear in any B's final_mses, in canonical order."""
@@ -112,40 +101,60 @@ def models_present(results):
 
 # ------------------------------- SCALING PLOTS -------------------------------
 def _scaling_series(results, keys, kind):
-    """Collect per-model (B, value) series. kind in {'test_mse','train_mse','walltime'}."""
+    """Per-model (xs, ys, lo, hi) series. kind in {'test_mse','train_mse','walltime'}.
+
+    final_mses[m] = {train, test, test_min, test_max}. For kind='test_mse', lo/hi carry the
+    per-B [min, max] spread across test trajectories; where a range is absent (e.g. seq, or
+    non-test kinds) lo/hi fall back to ys so no error bar is drawn for that point.
+    """
     series = {}
     for m in models_present(results):
-        xs, ys = [], []
+        xs, ys, los, his = [], [], [], []
         for k in keys:
             entry = results[k]
+            lo = hi = None
             if kind == "walltime":
                 v = entry.get("train_runtimes", {}).get(m)
-            else:  # final_mses: [train, test]
-                pair = entry.get("final_mses", {}).get(m)
-                if pair is None or len(pair) != 2:
+            else:
+                d = entry.get("final_mses", {}).get(m)
+                if not isinstance(d, dict):
                     v = None
-                else:
-                    v = pair[1] if kind == "test_mse" else pair[0]
+                elif kind == "test_mse":
+                    v, lo, hi = d.get("test"), d.get("test_min"), d.get("test_max")
+                else:  # train_mse
+                    v = d.get("train")
             if v is not None and np.isfinite(v):
                 xs.append(entry["B"])
                 ys.append(float(v))
+                lo_ok = lo is not None and np.isfinite(lo)
+                hi_ok = hi is not None and np.isfinite(hi)
+                los.append(float(lo) if lo_ok else float(v))
+                his.append(float(hi) if hi_ok else float(v))
         if xs:
-            series[m] = (np.array(xs, float), np.array(ys, float))
+            series[m] = (np.array(xs, float), np.array(ys, float),
+                         np.array(los, float), np.array(his, float))
     return series
-
 
 def plot_scaling(results, kind, ylabel, title, out_path):
     keys = sorted_B_keys(results)
     series = _scaling_series(results, keys, kind)
     fig, ax = plt.subplots(figsize=(7.5, 5))
-    for m, (xs, ys) in series.items():
-        ax.plot(xs, ys, marker="o", markersize=4, linewidth=1.6,
-                color=MODEL_COLOURS[m], label=MODEL_LABELS[m])
+    for m, (xs, ys, lo, hi) in series.items():
+        # For test MSE, draw the per-B [min, max] spread across test trajectories as
+        # asymmetric error bars (only where a real range is present).
+        if kind == "test_mse" and np.any((hi > ys) | (lo < ys)):
+            yerr = np.vstack([np.maximum(ys - lo, 0.0), np.maximum(hi - ys, 0.0)])
+            ax.errorbar(xs, ys, yerr=yerr, marker="o", markersize=4, linewidth=1.6,
+                        color=MODEL_COLOURS[m], label=MODEL_LABELS[m],
+                        capsize=3, elinewidth=1.0, alpha=0.9)
+        else:
+            ax.plot(xs, ys, marker="o", markersize=4, linewidth=1.6,
+                    color=MODEL_COLOURS[m], label=MODEL_LABELS[m])
     ax.set_xlabel("Number of training batches, B")
     ax.set_ylabel(ylabel)
     ax.set_title(title)
     if series:  # log y only makes sense with data present and positive
-        if all(np.all(ys > 0) for _, ys in series.values()):
+        if all(np.all(ys > 0) for _, ys, _, _ in series.values()):
             ax.set_yscale("log")
         ax.legend()
     ax.grid(True, which="both", linestyle="--", color="lightgrey", alpha=0.7)
@@ -159,7 +168,6 @@ def plot_scaling(results, kind, ylabel, title, out_path):
 def _admm_hist(entry, group, key):
     """Fetch entry[group]['admm'][key] or None."""
     return entry.get(group, {}).get("admm", {}).get(key)
-
 
 def plot_iter_metric(entry, B, kind, out_path):
     """One per-iteration ADMM plot for a single B. Returns True if a PNG was written."""
@@ -180,7 +188,26 @@ def plot_iter_metric(entry, B, kind, out_path):
         y = _admm_hist(entry, "mse_histories", key)
         if not y:
             plt.close(fig); return False
-        ax.plot(range(len(y)), y, color=col, linewidth=1.4)
+        mean = np.asarray(y, dtype=float)
+        x = range(len(mean))
+        ax.plot(x, mean, color=col, linewidth=1.4, label="mean over trajectories")
+        # ±1 std across trajectories (test: NUM_TEST trajs, train: B trajs), if recorded.
+        std_series = _admm_hist(entry, "mse_histories", key + "_std")
+        if std_series and len(std_series) == len(mean):
+            std = np.asarray(std_series, dtype=float)
+            upper = mean + std
+            lower = mean - std
+            # log axis can't render a non-positive lower edge, so clip it to a small positive
+            # floor (2 decades below the smallest positive mean) and cap ylim to the means so
+            # the clipped band doesn't blow out the view.
+            pos = mean[mean > 0]
+            floor = float(pos.min()) * 1e-2 if pos.size else 1e-12
+            ax.fill_between(x, np.clip(lower, floor, None), upper,
+                            color=col, alpha=0.2, linewidth=0,
+                            label=r"$\pm 1$ std across trajectories")
+            if pos.size:
+                ax.set_ylim(bottom=float(pos.min()) * 0.5)
+            ax.legend()
         ax.set_ylabel(f"{'Test' if kind == 'test_mse' else 'Train'} MSE")
         ax.set_yscale("log")
 
@@ -213,7 +240,6 @@ def plot_iter_metric(entry, B, kind, out_path):
     plt.close(fig)
     print(f"wrote {out_path}")
     return True
-
 
 def ylabel_for(kind):
     return {
