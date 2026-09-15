@@ -26,6 +26,8 @@ def run_training(
     num_test_trajectories: int,
     seed: int,
     run_admm_baseline: bool = True,
+    consensus_aggregator="mean", # "mean" | "under-relaxed" 
+    subproblem_warmstart="previous", # "consensus" | "relaxed" | "previous"
     run_sequential_baseline: bool = False,
     run_monolithic_baseline: bool = True,
     return_models: bool = True
@@ -104,9 +106,9 @@ def run_training(
         # iterations (subproblems are far from consensus early on -> tight solves are wasted)
         admm_early_solver_options = {
             "max_iter": 100,
-            "tol": 1e-3,
-            "acceptable_tol": 1e-2,
-            "acceptable_iter": 5
+            "tol": 1e-4,
+            "acceptable_tol": 1e-3,
+            "acceptable_iter": 15
         }
         # standard tolerances for the remaining ADMM iterations
         admm_late_solver_options = {
@@ -137,16 +139,17 @@ def run_training(
         admm_training_options = dict(
             early_solver_options=admm_early_solver_options,
             late_solver_options=admm_late_solver_options,
-            admm_abs_tol=1e-3,   # ε_abs (per-parameter absolute floor)
-            admm_rel_tol=5e-4,   # ε_rel (Boyd-recommended 1e-3..1e-4)
-            max_admm_iterations=500,
-            num_early_iterations=25, # opening iters using early_solver_options
-            num_convergence_confirmations=2, # consecutive sub-tol iters before stopping (Boyd: 1)
+            admm_abs_tol=1e-4,   # ε_abs (per-parameter absolute floor)
+            admm_rel_tol=1e-3,   # ε_rel (Boyd-recommended 1e-3..1e-4)
+            max_admm_iterations=1000,
+            num_early_iterations=20, # opening iters using early_solver_options
+            num_convergence_confirmations=3, # consecutive sub-tol iters before stopping (Boyd: 1)
             near_stopping_band=1.5,  # early stop when residuals sit within this x eps
-            training_clock_budget=60, # minutes; None = no wall-clock cap
-            consensus_aggregator="under-relaxed", # ADMM iteration frequency to check convergence
+            training_clock_budget=90, # minutes; None = no wall-clock cap
+            consensus_aggregator=consensus_aggregator, 
+            subproblem_warmstart=subproblem_warmstart, 
             mse_eval_options=mse_eval_options,
-            mse_eval_every=5 # evaluate/record prediction MSE every N ADMM iters (raise to cut eval wall-clock)
+            mse_eval_every=10 # evaluate/record prediction MSE every N ADMM iters (raise to cut eval wall-clock)
         )
         print("\n\nTraining ADMM consensus model (DC) ...\n\n")
         admm = ADMM(**admm_config)
@@ -262,7 +265,9 @@ def run_training(
     print(f"{'Method':<32}{'Train (s)':>12}{'Final train MSE':>22}{'Final test MSE':>22}")
     for m in ('mono', 'admm', 'seq'):
         if m in train_runtimes:
-            train_mse, test_mse = final_mses.get(m, (float('nan'), float('nan')))
+            mses = final_mses.get(m, {})
+            train_mse = mses.get('train', float('nan'))
+            test_mse = mses.get('test', float('nan'))
             print(f"{method_labels[m]:<32}{train_runtimes[m]:>12.2f}{train_mse:>22.6e}{test_mse:>22.6e}")
     print("=" * 92 + "\n")
 

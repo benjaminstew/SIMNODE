@@ -27,7 +27,6 @@ from data.bioreactor_simulation.run_training import run_training
 STATE_COLS = ['G', 'O', 'X', 'Xd', 'P', 'L', 'CO2']
 NN_LAYER_SIZES = [len(STATE_COLS), 16, len(STATE_COLS)]
 NUM_TEST = 25
-B_MIN, B_MAX = 2, 25 # sweep B = 2 .. 45 training trajectories
 SEED = 0 # fixes the train/test split per B (reproducible)
 
 def extract_trained_params(method: str, model) -> dict:
@@ -52,7 +51,7 @@ def extract_trained_params(method: str, model) -> dict:
 
 
 def main():
-    batch_sizes = list(range(B_MIN, B_MAX + 1))
+    batch_sizes = list(range(args.B_start, args.B_end + 1))
     print(f"Scaling sweep: B in {batch_sizes}, test set size = {NUM_TEST}")
     print(f"results -> {args.results_path}")
     out = {
@@ -83,6 +82,8 @@ def main():
                 num_test_trajectories=NUM_TEST,
                 seed=SEED,
                 run_admm_baseline=True,
+                consensus_aggregator=args.consensus_aggregator,
+                subproblem_warmstart=args.subproblem_warmstart,
                 run_sequential_baseline=False,
                 run_monolithic_baseline=True,
                 return_models=True 
@@ -93,7 +94,7 @@ def main():
                 m: {k: (float(v) if v is not None else None) for k, v in d.items()}
                 for m, d in res.get("final_mses", {}).items()
             }
-
+            
             # The *_history objects are already built as dicts-of-lists => JSON-serialisable
             mse_histories = res.get("mse_histories", {})
             residual_histories = res.get("residual_histories", {})
@@ -132,5 +133,13 @@ if __name__ == "__main__":
                         help="Path to the CSV data file to train on.")
     parser.add_argument("--results-path", type=Path, required=True,
                         help="Path to write the results .json (parent dirs created as needed).")
+    parser.add_argument("--B_start", type=int, metavar="B_START", required=True,
+                        help="Start of training batch sizes to sweep over")
+    parser.add_argument("--B_end", type=int, metavar="B_END", required=True,
+                        help="End of training batch sizes to sweep over")
+    parser.add_argument("--consensus-aggregator", type=str, required=True, 
+                        help="ADMM consensus aggregator: 'mean' | 'under-relaxed'")
+    parser.add_argument("--subproblem-warmstart", type=str, required=True, 
+                        help="ADMM subproblem warmstart: 'consensus' | 'relaxed' | 'previous'")
     args = parser.parse_args()
     main()
