@@ -50,6 +50,38 @@ def extract_trained_params(method: str, model) -> dict:
     }
 
 
+def print_admm_hyperparams(admm_config, admm_training_options, fast_admm, restart_eta, accel_start_iter):
+    """Print a table of every ADMM / Fast ADMM hyperparameter (once, at the top of the run log).
+
+    Passed to run_training as `hyperparam_printer`; run_training invokes it with the config it built.
+    """
+    rows = []
+    # (1) training-loop options (everything in admm_training_options except the MSE-eval settings)
+    for k in ("early_solver_options", "late_solver_options", "admm_abs_tol", "admm_rel_tol",
+              "max_admm_iterations", "num_early_iterations", "num_convergence_confirmations",
+              "near_stopping_band", "training_clock_budget", "consensus_aggregator", "subproblem_warmstart"):
+        rows.append((k, admm_training_options.get(k)))
+    # (2) adaptive-ρ (penalty) settings (from admm_config). adaptive_rho shows the EFFECTIVE value
+    # (fast ADMM forces it False), and mu is the residual-balancing factor.
+    rows.append(("adaptive_rho", admm_config.get("adaptive_penalty_update")))
+    rows.append(("mu", admm_config.get("mu")))
+    # (3)+(4) under-relaxation weight/schedule and warm-start schedule (from admm_config)
+    for k in ("relaxation_alpha", "relaxation_start_iter", "warmstart_start_iter"):
+        rows.append((k, admm_config.get(k)))
+    # (4) Fast ADMM hyperparameters
+    rows.append(("fast_admm", fast_admm))
+    if fast_admm:
+        rows.append(("restart_eta", restart_eta))
+        rows.append(("accel_start_iter", accel_start_iter))
+
+    width = max(len(k) for k, _ in rows)
+    bar = "=" * 64
+    print(f"\n{bar}\nADMM HYPERPARAMETERS ({'Fast ADMM' if fast_admm else 'standard ADMM'})\n{bar}")
+    for k, v in rows:
+        print(f"  {k:<{width}} : {v}")
+    print(f"{bar}\n")
+
+
 def main():
     batch_sizes = list(range(args.B_start, args.B_end + 1))
     print(f"Scaling sweep: B in {batch_sizes}, test set size = {NUM_TEST}")
@@ -84,12 +116,17 @@ def main():
                 run_admm_baseline=True,
                 consensus_aggregator=args.consensus_aggregator,
                 subproblem_warmstart=args.subproblem_warmstart,
+                fast_admm=args.fast_admm,
+                adaptive_rho=args.adaptive_rho,
+                mu=args.mu,
+                # print the hyperparameter table once, at the top of the log (first B only)
+                hyperparam_printer=(print_admm_hyperparams if B == batch_sizes[0] else None),
                 run_sequential_baseline=False,
                 run_monolithic_baseline=True,
-                return_models=True 
+                return_models=True
             )
             train_runtimes = {m: float(t) for m, t in res["train_runtimes"].items()}
-            # final_mses[m] = {train, test, test_min, test_max}; test_min/max may be None (e.g. seq).
+            # final_mses[m] = {train, test, test_std, test_min, test_max}; std/min/max may be None (e.g. seq).
             final_mses = {
                 m: {k: (float(v) if v is not None else None) for k, v in d.items()}
                 for m, d in res.get("final_mses", {}).items()
@@ -139,7 +176,17 @@ if __name__ == "__main__":
                         help="End of training batch sizes to sweep over")
     parser.add_argument("--consensus-aggregator", type=str, required=True, 
                         help="ADMM consensus aggregator: 'mean' | 'under-relaxed'")
-    parser.add_argument("--subproblem-warmstart", type=str, required=True, 
+    parser.add_argument("--subproblem-warmstart", type=str, required=True,
                         help="ADMM subproblem warmstart: 'consensus' | 'relaxed' | 'previous'")
+    parser.add_argument("--fast-admm", action="store_true",
+                        help="Run Goldstein 2014 Fast ADMM (Alg 8: Nesterov momentum + restart, "
+                             "fixed ρ, mean consensus) instead of standard ADMM. Pass the bare flag "
+                             "to enable; omit it to run standard ADMM.")
+    parser.add_argument("--adaptive-rho", action=argparse.BooleanOptionalAction, default=True,
+                        help="Adaptive ρ via Boyd residual balancing (default on). Pass --no-adaptive-rho "
+                             "for a fixed ρ=√B run. Forced off (fixed ρ) whenever --fast-admm is set.")
+    parser.add_argument("--mu", type=float, default=3.0,
+                        help="Adaptive-ρ residual-balancing factor μ: increase ρ when the primal/dual "
+                             "ratio-to-tolerance exceeds μ, decrease when below 1/μ (default 3.0).")
     args = parser.parse_args()
     main()

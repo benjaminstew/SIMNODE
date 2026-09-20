@@ -12,8 +12,11 @@ Two families of plot, each individually selectable via --plots:
     training_loss    -> training_loss_vs_iter_B=<B>.png     
     test_mse         -> test_mse_vs_iter_B=<B>.png
     train_mse        -> train_mse_vs_iter_B=<B>.png
-    primal_residual  -> primal_residual_vs_iter_B=<B>.png     
-    dual_residual    -> dual_residual_vs_iter_B=<B>.png        
+    primal_residual  -> primal_residual_vs_iter_B=<B>.png
+    dual_residual    -> dual_residual_vs_iter_B=<B>.png
+    primal_dual_residual -> primal_dual_residual_vs_iter_B=<B>.png  (both residuals + both acceptance regions)
+
+  The primal/dual residual plots shade the convergence acceptance region (residual <= --stop-band * eps).
 """
 import os
 import json
@@ -36,9 +39,15 @@ MODEL_COLOURS = {
 }
 MODEL_ORDER = ('mono', 'admm', 'seq')
 
+# Convergence acceptance region is (residual <= NEAR_STOPPING_BAND * eps). This factor mirrors
+# `near_stopping_band` in the ADMM solver and is NOT stored in the sweep JSON, so it is exposed
+# via --stop-band (defaulting to this value) in case a run used a different band.
+NEAR_STOPPING_BAND = 1.5
+
 # Which plot keys are across-B vs per-B-per-iteration.
 SCALING_PLOTS = ('test_mse_scaling', 'train_mse_scaling', 'walltime_scaling')
-ITER_PLOTS = ('training_loss', 'test_mse', 'train_mse', 'primal_residual', 'dual_residual')
+ITER_PLOTS = ('training_loss', 'test_mse', 'train_mse',
+              'primal_residual', 'dual_residual', 'primal_dual_residual')
 ALL_PLOTS = SCALING_PLOTS + ITER_PLOTS
 
 
@@ -65,6 +74,12 @@ def parse_args():
         "--batch-sizes", nargs="*", type=int, default=None, metavar="B",
         help="For the per-iteration plots, which B to plot (default: every B in the sweep). "
              "Ignored by the across-B scaling plots.",
+    )
+    parser.add_argument(
+        "--stop-band", type=float, default=NEAR_STOPPING_BAND, metavar="MULT",
+        help="Convergence acceptance region shaded on the residual plots is (residual <= MULT * eps). "
+             "Mirrors the ADMM solver's near_stopping_band; it is not stored in the sweep JSON, so set "
+             f"it to match your run (default {NEAR_STOPPING_BAND}).",
     )
     args = parser.parse_args()
 
@@ -103,9 +118,9 @@ def models_present(results):
 def _scaling_series(results, keys, kind):
     """Per-model (xs, ys, lo, hi) series. kind in {'test_mse','train_mse','walltime'}.
 
-    final_mses[m] = {train, test, test_min, test_max}. For kind='test_mse', lo/hi carry the
-    per-B [min, max] spread across test trajectories; where a range is absent (e.g. seq, or
-    non-test kinds) lo/hi fall back to ys so no error bar is drawn for that point.
+    final_mses[m] = {train, test, test_std, test_min, test_max}. For kind='test_mse', lo/hi carry
+    the mean ± 1 std spread across test trajectories; where std is absent (e.g. seq, or non-test
+    kinds) lo/hi fall back to ys so no ribbon is drawn for that point.
     """
     series = {}
     for m in models_present(results):
@@ -120,7 +135,12 @@ def _scaling_series(results, keys, kind):
                 if not isinstance(d, dict):
                     v = None
                 elif kind == "test_mse":
-                    v, lo, hi = d.get("test"), d.get("test_min"), d.get("test_max")
+                    v = d.get("test")
+                    sd = d.get("test_std")
+                    if v is not None and sd is not None and np.isfinite(sd):
+                        lo, hi = v - sd, v + sd          # preferred: mean ± 1 std
+                    else:
+                        lo, hi = d.get("test_min"), d.get("test_max")  # fall back to [min, max]
                 else:  # train_mse
                     v = d.get("train")
             if v is not None and np.isfinite(v):
@@ -140,24 +160,22 @@ def plot_scaling(results, kind, ylabel, title, out_path):
     series = _scaling_series(results, keys, kind)
     fig, ax = plt.subplots(figsize=(7.5, 5))
     for m, (xs, ys, lo, hi) in series.items():
-        # For test MSE, draw the per-B [min, max] spread across test trajectories as
-        # asymmetric error bars (only where a real range is present).
+        ax.plot(xs, ys, marker="o", markersize=4, linewidth=1.6,
+                color=MODEL_COLOURS[m], label=MODEL_LABELS[m])
+        # For test MSE, shade a mean ± 1 std ribbon across test trajectories where recorded.
         if kind == "test_mse" and np.any((hi > ys) | (lo < ys)):
-            yerr = np.vstack([np.maximum(ys - lo, 0.0), np.maximum(hi - ys, 0.0)])
-            ax.errorbar(xs, ys, yerr=yerr, marker="o", markersize=4, linewidth=1.6,
-                        color=MODEL_COLOURS[m], label=MODEL_LABELS[m],
-                        capsize=3, elinewidth=1.0, alpha=0.9)
-        else:
-            ax.plot(xs, ys, marker="o", markersize=4, linewidth=1.6,
-                    color=MODEL_COLOURS[m], label=MODEL_LABELS[m])
-    ax.set_xlabel("Number of training batches, B")
+            # clip the lower edge to a positive floor so the log axis can render it
+            pos = ys[ys > 0]
+            floor = float(pos.min()) * 1e-2 if pos.size else 1e-12
+            ax.fill_between(xs, np.clip(lo, floor, None), hi,
+                            color=MODEL_COLOURS[m], alpha=0.15, linewidth=0)
+    ax.set_xlabel("Number of training trajectories, B")
     ax.set_ylabel(ylabel)
     ax.set_title(title)
     if series:  # log y only makes sense with data present and positive
         if all(np.all(ys > 0) for _, ys, _, _ in series.values()):
             ax.set_yscale("log")
         ax.legend()
-    ax.grid(True, which="both", linestyle="--", color="lightgrey", alpha=0.7)
     fig.tight_layout()
     fig.savefig(out_path, dpi=200, bbox_inches="tight")
     plt.close(fig)
@@ -169,7 +187,23 @@ def _admm_hist(entry, group, key):
     """Fetch entry[group]['admm'][key] or None."""
     return entry.get(group, {}).get("admm", {}).get(key)
 
-def plot_iter_metric(entry, B, kind, out_path):
+def _shade_acceptance(ax, x, y, band, stop_band, colour, label):
+    """Shade the acceptance region between the residual line and the acceptance ceiling (stop_band * eps).
+
+    Only the area above the residual that lies within the acceptance band is shaded: visible only
+    when (or as) the residual enters the band. `y` is the residual array, `band` is eps per iteration.
+    Returns a y-floor for the caller to set ax.set_ylim(bottom=floor).
+    """
+    y = np.asarray(y, dtype=float)
+    band = np.asarray(band, dtype=float)
+    upper = stop_band * band
+    pos = band[band > 0]
+    floor = float(pos.min()) * 0.3 if pos.size else 1e-12
+    ax.fill_between(x, y, upper, where=(y < upper), interpolate=True,
+                    color=colour, alpha=0.3, linewidth=0, label=label)
+    return floor
+
+def plot_iter_metric(entry, B, kind, out_path, stop_band=NEAR_STOPPING_BAND):
     """One per-iteration ADMM plot for a single B. Returns True if a PNG was written."""
     fig, ax = plt.subplots(figsize=(7, 5))
     col = MODEL_COLOURS["admm"]
@@ -215,26 +249,71 @@ def plot_iter_metric(entry, B, kind, out_path):
         if kind == "primal_residual":
             y = _admm_hist(entry, "residual_histories", "primal_avg")
             band = _admm_hist(entry, "residual_histories", "eps_pri")
-            ylabel, band_label = "Primal residual", r"$\epsilon_{pri}$"
+            line_label, band_label = "Primal residual", r"$\epsilon_{pri}$"
+            ylabel = r"$\|r\|_2$"
+            accept_label = fr"Accepted band ($\epsilon_{{pri}} \leq {stop_band:g}$)"
         else:
             y = _admm_hist(entry, "residual_histories", "dual")
             band = _admm_hist(entry, "residual_histories", "eps_dual")
-            ylabel, band_label = "Dual residual", r"$\epsilon_{dual}$"
+            line_label, band_label = "Dual residual", r"$\epsilon_{dual}$"
+            ylabel = r"$\|s\|_2$"
+            accept_label = fr"Accepted band ($\epsilon_{{dual}} \leq {stop_band:g}$)"
         if not y:
             plt.close(fig); return False
-        ax.plot(range(len(y)), y, color=col, linewidth=1.4, label=ylabel)
+        y = np.asarray(y, dtype=float)
+        ax.plot(range(len(y)), y, color=col, linewidth=1.4, label=line_label)
+        floor = None
         if band:
-            ax.plot(range(len(band)), band, color="grey", linestyle="--",
+            band = np.asarray(band, dtype=float)
+            m = min(len(y), len(band))
+            ax.plot(range(m), band[:m], color="grey", linestyle="--",
                     linewidth=1.0, label=band_label)
+            floor = _shade_acceptance(
+                ax, np.arange(m), y[:m], band[:m], stop_band,
+                (150 / 255, 200 / 255, 150 / 255), accept_label)
         ax.set_ylabel(ylabel)
         ax.set_yscale("log")
+        if floor is not None:
+            ax.set_ylim(bottom=floor)
         ax.legend()
+
+    elif kind == "primal_dual_residual":
+        yp = _admm_hist(entry, "residual_histories", "primal_avg")
+        yd = _admm_hist(entry, "residual_histories", "dual")
+        if not yp or not yd:
+            plt.close(fig); return False
+        bp = _admm_hist(entry, "residual_histories", "eps_pri")
+        bd = _admm_hist(entry, "residual_histories", "eps_dual")
+        c_pri, c_dual = MODEL_COLOURS["admm"], MODEL_COLOURS["mono"]
+        yp = np.asarray(yp, dtype=float)
+        yd = np.asarray(yd, dtype=float)
+        ax.plot(range(len(yp)), yp, color=c_pri, linewidth=1.4, label="Primal residual")
+        ax.plot(range(len(yd)), yd, color=c_dual, linewidth=1.4, label="Dual residual")
+        floors = []
+        for band, base, colour, tex, sub in (
+            (bp, yp, c_pri, r"\epsilon_{pri}", "pri"),
+            (bd, yd, c_dual, r"\epsilon_{dual}", "dual"),
+        ):
+            if not band:
+                continue
+            band = np.asarray(band, dtype=float)
+            m = min(len(base), len(band))
+            ax.plot(range(m), band[:m], color=colour, linestyle="--",
+                    linewidth=0.9, alpha=0.7, label=fr"${tex}$")
+            floors.append(_shade_acceptance(
+                ax, np.arange(m), base[:m], band[:m], stop_band, colour,
+                fr"Accepted band ($\epsilon_{{{sub}}} \leq {stop_band:g}$)"))
+        ax.set_ylabel(r"$\|r\|_2,\;\|s\|_2$")
+        ax.set_yscale("log")
+        if floors:
+            ax.set_ylim(bottom=min(floors))
+        ax.legend(fontsize=8)
+
     else:
         plt.close(fig); return False
 
-    ax.set_xlabel("ADMM iteration")
+    ax.set_xlabel("ADMM iteration count")
     ax.set_title(f"{ylabel_for(kind)} vs iteration (B = {B})")
-    ax.grid(True, which="both", linestyle="--", color="lightgrey", alpha=0.7)
     fig.tight_layout()
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
@@ -248,6 +327,7 @@ def ylabel_for(kind):
         "train_mse": "Train MSE",
         "primal_residual": "Primal residual",
         "dual_residual": "Dual residual",
+        "primal_dual_residual": "Primal & dual residual",
     }[kind]
 
 
@@ -295,7 +375,7 @@ def main():
                 continue
             for kind in iter_selected:
                 out_path = out_dir / f"{kind}_vs_iter_B={B}.png"
-                wrote = plot_iter_metric(entry, B, kind, out_path)
+                wrote = plot_iter_metric(entry, B, kind, out_path, stop_band=args.stop_band)
                 if not wrote:
                     print(f"skipping {kind} for B={B}: no ADMM history for this metric")
 

@@ -26,8 +26,17 @@ def run_training(
     num_test_trajectories: int,
     seed: int,
     run_admm_baseline: bool = True,
-    consensus_aggregator="mean", # "mean" | "under-relaxed" 
-    subproblem_warmstart="previous", # "consensus" | "relaxed" | "previous"
+    consensus_aggregator="under-relaxed", # "mean" | "under-relaxed"
+    subproblem_warmstart="consensus", # "consensus" | "relaxed" | "previous"
+    fast_admm: bool = False, # run Goldstein 2014 Fast ADMM (Alg 8) instead of standard ADMM
+    restart_eta: float = 0.9, # Fast ADMM restart threshold η (only used when fast_admm)
+    accel_start_iter: int = 25, # Fast ADMM: iter at which momentum turns on (only used when fast_admm)
+    relaxation_alpha: float = 0.5, # under-relaxation weight α (θ̂ = α·θ + (1-α)·z); α<1 damps spikes
+    relaxation_start_iter: int = 10, # iter after which under-relaxed aggregation activates
+    warmstart_start_iter: int = 25, # iter after which subproblem warm start activates
+    adaptive_rho: bool = True, # adaptive ρ via Boyd residual balancing; fast_admm forces fixed ρ
+    mu: float = 3.0, # adaptive-ρ residual-balancing factor μ
+    hyperparam_printer=None,
     run_sequential_baseline: bool = False,
     run_monolithic_baseline: bool = True,
     return_models: bool = True
@@ -46,7 +55,7 @@ def run_training(
           'mse_histories':  {method: {train_mse: [...], test_mse: [...], ...}},
           'residual_histories': {admm: {primal_avg: [...], dual: [...], rho: [...], ...}},
           'objective_histories': {admm: {obj_per_batch: [...], ...}},
-          'final_mses': {method: {train, test, test_min, test_max}},  # range = per-test-traj MSE spread
+          'final_mses': {method: {train, test, test_std, test_min, test_max}},  # std/range = per-test-traj spread
           # the following are added only when return_models=True:
           'trained_models': {method: fitted model object},
           'test_grid': [...], 'Y_test_obs': ndarray, 'train_grid': [...], 'Y_obs': ndarray,
@@ -81,7 +90,7 @@ def run_training(
     mse_eval_options = {
         "train_grid": train_grid,
         "Y_obs": Y_obs,
-        "test_grid": test_grid,
+        "test_grid": test_grid, 
         "Y_test_obs": Y_test_obs,
         "rtol": 1e-7,
         "atol": 1e-9,
@@ -105,14 +114,14 @@ def run_training(
         # softer tolerances / fewer IPOPT iterations for the first `num_early_iterations` ADMM
         # iterations (subproblems are far from consensus early on -> tight solves are wasted)
         admm_early_solver_options = {
-            "max_iter": 100,
+            "max_iter": 200,
             "tol": 1e-4,
             "acceptable_tol": 1e-3,
-            "acceptable_iter": 15
+            "acceptable_iter": 10
         }
         # standard tolerances for the remaining ADMM iterations
         admm_late_solver_options = {
-            "max_iter": 500,
+            "max_iter": 1000,
             "tol": 1e-6,
             "acceptable_tol": 1e-5,
             "acceptable_iter": 15
@@ -124,36 +133,50 @@ def run_training(
             obs_times=train_grid,               
             state_lower_bound=-5,
             state_upper_bound=50,
-            param_lower_bound=-50,
-            param_upper_bound=50,
+            param_lower_bound=-10,
+            param_upper_bound=10,
             l2_reg_param=1e-4,
             use_pool=True,
             warm_init=True,
-            adaptive_penalty_update=True, 
-            adaptive_tol_update=True,     
+            adaptive_penalty_update=(adaptive_rho and not fast_admm), # fast ADMM forces fixed ρ; else honour adaptive_rho
+            mu=mu,                                                    # adaptive-ρ residual-balancing factor μ
+            adaptive_tol_update=True,
             transcription_method='dc',
-            irrdc_param=None,                        
-            num_res_eval_nodes=None                  
+            irrdc_param=None,
+            num_res_eval_nodes=None,
+            relaxation_alpha=relaxation_alpha,           # under-relaxation weight α
+            relaxation_start_iter=relaxation_start_iter, # iter under-relaxation activates
+            warmstart_start_iter=warmstart_start_iter    # iter subproblem warm start activates
         )
 
         admm_training_options = dict(
             early_solver_options=admm_early_solver_options,
             late_solver_options=admm_late_solver_options,
-            admm_abs_tol=1e-4,   # ε_abs (per-parameter absolute floor)
+            admm_abs_tol=5e-4,   # ε_abs (per-parameter absolute floor)
             admm_rel_tol=1e-3,   # ε_rel (Boyd-recommended 1e-3..1e-4)
-            max_admm_iterations=1000,
+            max_admm_iterations=2000,
             num_early_iterations=20, # opening iters using early_solver_options
-            num_convergence_confirmations=3, # consecutive sub-tol iters before stopping (Boyd: 1)
+            num_convergence_confirmations=2, # consecutive sub-tol iters before stopping (Boyd: 1)
             near_stopping_band=1.5,  # early stop when residuals sit within this x eps
-            training_clock_budget=90, # minutes; None = no wall-clock cap
-            consensus_aggregator=consensus_aggregator, 
-            subproblem_warmstart=subproblem_warmstart, 
+            training_clock_budget=60, # minutes; None = no wall-clock cap
+            consensus_aggregator=consensus_aggregator,
+            subproblem_warmstart=subproblem_warmstart,
             mse_eval_options=mse_eval_options,
             mse_eval_every=10 # evaluate/record prediction MSE every N ADMM iters (raise to cut eval wall-clock)
         )
-        print("\n\nTraining ADMM consensus model (DC) ...\n\n")
+        if hyperparam_printer is not None:
+            hyperparam_printer(admm_config, admm_training_options, fast_admm, restart_eta, accel_start_iter)
         admm = ADMM(**admm_config)
-        admm.run_admm_training(**admm_training_options)
+        if fast_admm:
+            # Fast ADMM keeps the chosen consensus_aggregator (mean or under-relaxed) and adds the restart params
+            fast_admm_training_options = dict(admm_training_options)
+            fast_admm_training_options["restart_eta"] = restart_eta
+            fast_admm_training_options["accel_start_iter"] = accel_start_iter
+            print("\n\nTraining Fast ADMM consensus model (DC, Goldstein 2014 Alg 8) ...\n\n")
+            admm.run_fast_admm_training(**fast_admm_training_options)
+        else:
+            print("\n\nTraining ADMM consensus model (DC) ...\n\n")
+            admm.run_admm_training(**admm_training_options)
         train_runtimes['admm'] = admm.train_runtime
         mse_histories['admm'] = admm.mse_history
         residual_histories['admm'] = admm.residual_history
@@ -162,6 +185,7 @@ def run_training(
         final_mses['admm'] = {
             "train": admm.final_train_mse,
             "test": admm.final_test_mse,
+            "test_std": admm.final_test_mse_std,
             "test_min": admm.final_test_mse_range[0],
             "test_max": admm.final_test_mse_range[1],
         }
@@ -208,6 +232,7 @@ def run_training(
         final_mses['seq'] = {
             "train": mse_histories['seq']['train_mse'][-1],
             "test": mse_histories['seq']['test_mse'][-1],
+            "test_std": None,
             "test_min": None,
             "test_max": None,
         }
@@ -217,8 +242,8 @@ def run_training(
     if run_monolithic_baseline:
         monolithic_solver_options = {
             "max_iter": 1000,
-            "tol": 1e-6,
-            "acceptable_tol": 1e-5,
+            "tol": 1e-8,
+            "acceptable_tol": 1e-7,
             "acceptable_iter": 15
         }
         print("\n\nTraining monolithic Pyomo baseline ...\n\n")
@@ -241,13 +266,14 @@ def run_training(
             train_grid, Y_obs,
             rtol=mse_eval_options['rtol'], atol=mse_eval_options['atol'], max_step=mse_eval_options['max_step']
         )
-        mono_test_mse, _, mono_test_min, mono_test_max = mono.compute_prediction_mse(
+        mono_test_mse, mono_test_std, mono_test_min, mono_test_max = mono.compute_prediction_mse(
             test_grid, Y_test_obs, return_range=True,
             rtol=mse_eval_options['rtol'], atol=mse_eval_options['atol'], max_step=mse_eval_options['max_step']
         )
         final_mses['mono'] = {
             "train": mono_train_mse,
             "test": mono_test_mse,
+            "test_std": mono_test_std,
             "test_min": mono_test_min,
             "test_max": mono_test_max,
         }

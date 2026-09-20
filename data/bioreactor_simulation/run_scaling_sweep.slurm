@@ -49,10 +49,13 @@ if [[ -z "${SLURM_JOB_ID:-}" ]]; then
     read -rp "  Subproblem warmstart  (consensus|relaxed|previous) [consensus]: " WARMSTART
     WARMSTART="${WARMSTART:-consensus}"
 
+    read -rp "  Fast ADMM (Goldstein 2014 Alg 8)  (y/n) [n]: " FAST_ADMM
+    FAST_ADMM="${FAST_ADMM:-n}"
+
     echo
     echo "About to submit:"
     echo "  job-name=$JOB_NAME  cpus-per-task=$CPUS  mem=$MEM  time=$TIME  output=$LOG"
-    echo "  results=$RESULTS  B=$B_START..$B_END  aggregator=$AGGREGATOR  warmstart=$WARMSTART"
+    echo "  results=$RESULTS  B=$B_START..$B_END  aggregator=$AGGREGATOR  warmstart=$WARMSTART  fast_admm=$FAST_ADMM"
     read -rp "Proceed? [y/N]: " CONFIRM
     if [[ ! "$CONFIRM" =~ ^[Yy]([Ee][Ss])?$ ]]; then
         echo "Aborted; nothing submitted."
@@ -67,7 +70,7 @@ if [[ -z "${SLURM_JOB_ID:-}" ]]; then
         --mem="$MEM" \
         --time="$TIME" \
         --output="$LOG" \
-        "$0" "$RESULTS" "$B_START" "$B_END" "$AGGREGATOR" "$WARMSTART"
+        "$0" "$RESULTS" "$B_START" "$B_END" "$AGGREGATOR" "$WARMSTART" "$FAST_ADMM"
 fi
 
 # =============================================================================
@@ -98,6 +101,13 @@ B_START="${2:-1}"
 B_END="${3:-100}"
 AGGREGATOR="${4:-mean}"
 WARMSTART="${5:-previous}"
+FAST_ADMM="${6:-no}"
+
+# Translate the yes/no answer into the store_true CLI flag (empty = standard ADMM).
+FAST_FLAG=""
+if [[ "$FAST_ADMM" =~ ^[Yy]([Ee][Ss])?$ ]]; then
+    FAST_FLAG="--fast-admm"
+fi
 
 echo "=================================================================="
 echo "SLURM job name : ${SLURM_JOB_NAME:-?} (id ${SLURM_JOB_ID:-?})"
@@ -109,6 +119,7 @@ echo "B start        : $B_START"
 echo "B end          : $B_END"
 echo "Aggregator     : $AGGREGATOR"
 echo "Warmstart      : $WARMSTART"
+echo "Fast ADMM      : $FAST_ADMM"
 echo "=================================================================="
 
 python -m data.bioreactor_simulation.run_scaling_sweep \
@@ -117,4 +128,5 @@ python -m data.bioreactor_simulation.run_scaling_sweep \
     --B_start "$B_START" \
     --B_end "$B_END" \
     --consensus-aggregator="$AGGREGATOR" \
-    --subproblem-warmstart="$WARMSTART"
+    --subproblem-warmstart="$WARMSTART" \
+    $FAST_FLAG
