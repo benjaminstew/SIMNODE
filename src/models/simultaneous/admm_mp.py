@@ -34,14 +34,14 @@ def solve_worker(payload: dict):
             payload["admm_penalty_param"],
             warmstart_mode=payload.get("warmstart_mode", "consensus"),
             relaxed_submodels_Ws=payload.get("relaxed_submodels_Ws", [None] * (WORKER.worker_id + 1))[WORKER.worker_id],
-            relaxed_submodels_bs=payload.get("relaxed_submodels_bs", [None] * (WORKER.worker_id + 1))[WORKER.worker_id],
+            relaxed_submodels_bs=payload.get("relaxed_submodels_bs", [None] * (WORKER.worker_id + 1))[WORKER.worker_id]
         )
         WORKER.solve_submodel(payload["solver_options"])
         return (WORKER.worker_id, WORKER.submodel_Ws, WORKER.submodel_bs,
                 WORKER.submodel_obj, WORKER.submodel_local_dc_obj)
     finally:
         # Barrier blocks each worker until all N have finished, forcing strict 1:1 batch->worker mapping 
-        # (no worker starts a second task early). In finally so a failed solve still releases the barrier instead of
+        # a failed solve still releases the barrier instead of
         # deadlocking; the exception still propagates via pool.map
         if BARRIER is not None:
             try:
@@ -60,8 +60,9 @@ class MPWorker:
         self.worker_id = worker_id
         self.layer_sizes = submodel_config['layer_sizes']
         self.warmstart_start_iter = submodel_config.get('warmstart_start_iter', 25)
+        group = submodel_config['subp_groups'][worker_id]
         self.submodel = NODEPyomo(
-            Y_obs=submodel_config['Y_obs'][worker_id],
+            Y_obs=submodel_config['Y_obs'][group],
             layer_sizes=self.layer_sizes,
             end_time=submodel_config['end_time'],
             state_lower_bound=submodel_config['state_lower_bound'],
@@ -74,7 +75,9 @@ class MPWorker:
             admm_penalty_param=submodel_config['admm_penalty_param'],
             transcription_method=submodel_config['transcription_method'],
             irrdc_param=submodel_config['irrdc_param'],
-            num_res_eval_nodes=submodel_config['num_res_eval_nodes']
+            num_res_eval_nodes=submodel_config['num_res_eval_nodes'],
+            # if warm_init=False then get reproducible per-worker Xavier draw
+            seed=submodel_config.get('worker_seeds', [None])[worker_id]
         )
         self.submodel_obj = float("nan")  # final subproblem objective, refreshed each solve
         self.submodel_local_dc_obj = float("nan")  # final subproblem objective without ADMM penalty, refreshed each solve
@@ -131,7 +134,7 @@ class MPWorker:
             dual_var_Ws: list, dual_var_bs: list,
             iteration_count: int,
             admm_penalty_param: float,
-            warmstart_mode: str = "previous",  # "consensus" | "relaxed" | "previous"
+            warmstart_mode: str = "previous", # "consensus" | "relaxed" | "previous"
             warm_init: bool = False,
             warm_init_submodel_Ws: list = None, warm_init_submodel_bs: list = None,
             relaxed_submodels_Ws: list = None, relaxed_submodels_bs: list = None
@@ -169,30 +172,30 @@ class PoolManager:
     MPWorker instances live entirely inside the child processes; this class only
     opens/closes the pool and dispatches work via Pool.map.
     """
-    def __init__(self, num_batches: int, submodel_config: dict):
-        self.num_batches = num_batches
+    def __init__(self, num_workers: int, submodel_config: dict):
+        self.num_workers = num_workers # one worker per ADMM subproblem
         self.pool = self.open_pool(submodel_config)
 
     def open_pool(self, submodel_config: dict):
         ctx = mp.get_context("spawn")
         id_queue = ctx.Queue()
-        for i in range(self.num_batches):
+        for i in range(self.num_workers):
             id_queue.put(i)
         # Barrier spanning all workers; used in solve_worker to force a 1:1
         # task->worker mapping each round (see solve_worker for rationale).
-        barrier = ctx.Barrier(self.num_batches)
+        barrier = ctx.Barrier(self.num_workers)
         pool = ctx.Pool(
-            processes=self.num_batches,
+            processes=self.num_workers,
             initializer=init_worker,
             initargs=(id_queue, submodel_config, barrier)
         )
-        print(f"Opened multiprocessing pool with {self.num_batches} workers.")
+        print(f"Opened multiprocessing pool with {self.num_workers} workers.")
         return pool
 
     def map(self, payload: dict) -> list[tuple]:
         '''Dispatch payload to all workers; return list of
         (worker_id, submodel_Ws, submodel_bs, submodel_obj, submodel_local_dc_obj).'''
-        return self.pool.map(solve_worker, [payload] * self.num_batches, chunksize=1)
+        return self.pool.map(solve_worker, [payload] * self.num_workers, chunksize=1)
 
     def close(self):
         if self.pool is not None:
@@ -222,21 +225,31 @@ class ADMM:
             l2_reg_param: float,
             obs_times: np.ndarray = None,
             use_pool: bool = True,
-            warm_init: bool = True,
-            adaptive_penalty_update: bool = True,
-            mu: float = 3.0,                    # adaptive-ρ residual-balancing factor (Boyd μ)
-            adaptive_tol_update: bool = True,
+            admm_warm_init: bool = True,
+            adaptive_admm_penalty: bool = True,
+            adaptive_admm_penalty_mu: float = None, # adaptive-ρ residual-balancing factor (Boyd μ)
+            adaptive_admm_tol: bool = True,
             transcription_method: str = 'dc',
             irrdc_param: float = None,
             num_res_eval_nodes: int = None,
-            relaxation_alpha: float = 0.3,      # under-relaxation weight α (θ̂ = α·θ + (1-α)·z); α<1 damps
-            relaxation_start_iter: int = 1,     # iter after which under-relaxed aggregation activates
-            warmstart_start_iter: int = 25      # iter after which subproblem warm start (consensus/relaxed) activates
+            relaxation_alpha: float = None, # under-relaxation weight α (θ̂ = α·θ + (1-α)·z); α<1 damps
+            relaxation_start_iter: int = None, # iter after which under-relaxed aggregation activates
+            warmstart_start_iter: int = None,# iter after which subproblem warm start (consensus/relaxed) activates
+            num_batches_per_subp: int = 1, # trajectories stitched block-diagonally into each subproblem (K)
+            seed: int = None # master seed; warmup init (warm_init) + per-worker child seeds
     ):
+        self.seed = seed
         self.Y_obs = Y_obs # ndarray (num_batches, batch_size, state_dim)
         self.num_batches, self.batch_size, self.state_dim = self.Y_obs.shape
+
+        # Multi-block ADMM: group the num_batches trajectories into num_subproblems subproblems, each
+        # holding up to num_batches_per_subp trajectories (block-diagonal, sharing one θ)
+        self.num_batches_per_subp = num_batches_per_subp
+        self.num_subproblems = max(1, int(np.ceil(self.num_batches / self.num_batches_per_subp)))
+        self.subp_groups = [[int(b) for b in g] for g in np.array_split(np.arange(self.num_batches), self.num_subproblems)]
+
         self.layer_sizes = layer_sizes
-        self.adaptive_tol_update = adaptive_tol_update
+        self.adaptive_admm_tol = adaptive_admm_tol
         self.num_params = sum(
             self.layer_sizes[l] * self.layer_sizes[l+1] + self.layer_sizes[l+1]
             for l in range(len(self.layer_sizes) - 1)
@@ -247,9 +260,9 @@ class ADMM:
         self.param_lower_bound = param_lower_bound
         self.param_upper_bound = param_upper_bound
         self.l2_reg_param = l2_reg_param
-        self.adaptive_penalty_update = adaptive_penalty_update
-        self.mu = mu  # adaptive-ρ residual-balancing factor (Boyd μ), routed from constructor
-        self.admm_penalty_param = np.sqrt(self.num_batches)  # initial rho for adpative or fixed penalty
+        self.adaptive_admm_penalty = adaptive_admm_penalty
+        self.adaptive_admm_penalty_mu = adaptive_admm_penalty_mu  # adaptive-ρ residual-balancing factor (Boyd μ), routed from constructor
+        self.admm_penalty_param = np.sqrt(self.num_subproblems)  # initial rho (Boyd scaling per consensus block)
         self.use_pool = use_pool
         self.transcription_method = transcription_method
         self.irrdc_param = irrdc_param
@@ -260,21 +273,30 @@ class ADMM:
         self.warmstart_start_iter = warmstart_start_iter
 
         self.dual_var_Ws, self.dual_var_bs = self.zero_init_dual_vars()
-        if warm_init:
+        if admm_warm_init:
             self.consensus_Ws, self.consensus_bs, self.submodels_Ws, self.submodels_bs = self.warm_init_params()
         else:
             self.consensus_Ws = [np.zeros((self.layer_sizes[l], self.layer_sizes[l+1])) for l in range(len(self.layer_sizes) - 1)]
             self.consensus_bs = [np.zeros((1, self.layer_sizes[l+1])) for l in range(len(self.layer_sizes) - 1)]
-            self.submodels_Ws = [[None for _ in range(len(self.layer_sizes) - 1)] for _ in range(self.num_batches)]
-            self.submodels_bs = [[None for _ in range(len(self.layer_sizes) - 1)] for _ in range(self.num_batches)]
+            self.submodels_Ws = [[None for _ in range(len(self.layer_sizes) - 1)] for _ in range(self.num_subproblems)]
+            self.submodels_bs = [[None for _ in range(len(self.layer_sizes) - 1)] for _ in range(self.num_subproblems)]
 
-        self.submodels_obj = [float("nan") for _ in range(self.num_batches)] # final subproblem objective, overwritten each solve
-        # per-batch primal used in the dual update: raw solves for mean/loss-weighted, relaxed θ̂ for under-relaxed
+        self.submodels_obj = [float("nan") for _ in range(self.num_subproblems)] # final subproblem objective, overwritten each solve
         self.relaxed_submodels_Ws = self.submodels_Ws
         self.relaxed_submodels_bs = self.submodels_bs
 
+        # Shared-seed cold init: every subproblem receives the SAME master seed, so with warm_init=False
+        # all subproblems draw the IDENTICAL Xavier weights (biases zero). Because the monolithic model
+        # is seeded with the same master, mono and every ADMM subproblem start from the same θ within a
+        # repeat -- initialisation is a single controlled factor, varied only across repeats (different
+        # master seed). Subproblems still diverge during solving because their trajectory data differ.
+        # (Under 'spawn' each child process gets independent OS entropy, so passing an explicit seed is
+        # what makes the init reproducible at all.) None -> workers stay unseeded (nondeterministic).
+        self.worker_seeds = [seed] * self.num_subproblems
+
         submodel_config = {
             'Y_obs': Y_obs,
+            'subp_groups': self.subp_groups, # worker_id -> list of trajectory indices for that subproblem
             'layer_sizes': layer_sizes,
             'end_time': end_time,
             'state_lower_bound': state_lower_bound,
@@ -289,19 +311,19 @@ class ADMM:
             'obs_times': obs_times, 
             'init_dual_var_Ws': self.dual_var_Ws, 
             'init_dual_var_bs': self.dual_var_bs,
-            'warm_init': warm_init, 
+            'warm_init': admm_warm_init,
             'warm_init_consensus_Ws': self.consensus_Ws, 
             'warm_init_consensus_bs': self.consensus_bs, 
             'warm_init_submodel_Ws': self.submodels_Ws,
             'warm_init_submodel_bs': self.submodels_bs,
-            'warmstart_start_iter': warmstart_start_iter
+            'warmstart_start_iter': warmstart_start_iter,
+            'worker_seeds': self.worker_seeds # per-subproblem child seed for weights init
         }
-
         if use_pool:
             self.workers = None # MPWorker instances live in child processes
-            self.pool_manager = PoolManager(self.num_batches, submodel_config)
+            self.pool_manager = PoolManager(self.num_subproblems, submodel_config)
         else:
-            self.workers = [MPWorker(i, submodel_config) for i in range(self.num_batches)] 
+            self.workers = [MPWorker(i, submodel_config) for i in range(self.num_subproblems)]
             self.pool_manager = None
 
         # per-iteration training metric recording
@@ -322,8 +344,9 @@ class ADMM:
             "step_size": [] # Nesterov step size α^k (fast method only; 1.0 = no momentum)
         }
         self.objective_history = {
-            "obj_per_batch": []       # list[list]: per-subproblem final objective
+            "obj_per_batch": [] # list[list]: per-subproblem final objective
         }
+
         # Definitive final metrics at the converged consensus params (set by the final eval at the
         # end of run_admm_training). Range = (min, max) of per-trajectory final test MSE.
         self.final_train_mse = float("nan")
@@ -340,7 +363,8 @@ class ADMM:
         all submodel params from a single (unpenalised) submodel solve.
         '''
         warmup_model = NODEPyomo(
-            Y_obs=self.Y_obs[0], # choose first batch for warmup solve
+            seed=self.seed, # reproducible Xavier init for the single warmup solve
+            Y_obs=self.Y_obs[:1], # first trajectory (kept 3-D (1, N, D)) for the warmup solve
             layer_sizes=self.layer_sizes,
             end_time=self.end_time,
             state_lower_bound=self.state_lower_bound, state_upper_bound=self.state_upper_bound,
@@ -365,19 +389,19 @@ class ADMM:
         init_consensus_bs = [warmup_model.pyomo_var_to_numpy(
                                 warmup_model.model.bs[l].b, (1, self.layer_sizes[l])
                             ) for l in warmup_model.model.l]
-        init_submodels_Ws = [[w.copy() for w in init_consensus_Ws] for _ in range(self.num_batches)]
-        init_submodels_bs = [[b.copy() for b in init_consensus_bs] for _ in range(self.num_batches)]
+        init_submodels_Ws = [[w.copy() for w in init_consensus_Ws] for _ in range(self.num_subproblems)]
+        init_submodels_bs = [[b.copy() for b in init_consensus_bs] for _ in range(self.num_subproblems)]
 
         return init_consensus_Ws, init_consensus_bs, init_submodels_Ws, init_submodels_bs
 
     def zero_init_dual_vars(self):
         dual_var_Ws = [
             [np.zeros((self.layer_sizes[l], self.layer_sizes[l+1])) for l in range(len(self.layer_sizes) - 1)]
-            for _ in range(self.num_batches)
+            for _ in range(self.num_subproblems)
         ]
         dual_var_bs = [
             [np.zeros((1, self.layer_sizes[l+1])) for l in range(len(self.layer_sizes) - 1)]
-            for _ in range(self.num_batches)
+            for _ in range(self.num_subproblems)
         ]
         return dual_var_Ws, dual_var_bs
 
@@ -386,7 +410,7 @@ class ADMM:
 
     def solve_submodels_sequential(self, solver_options: dict, iteration_count: int,
                                    warmstart_mode: str = "consensus"):
-        for i in range(self.num_batches):
+        for i in range(self.num_subproblems):
             self.workers[i].broadcast_consensus_and_duals(
                 self.consensus_Ws, self.consensus_bs,
                 self.dual_var_Ws[i], self.dual_var_bs[i],
@@ -431,13 +455,13 @@ class ADMM:
 
         self.consensus_Ws = [w.copy() for w in self.submodels_Ws[0]]
         self.consensus_bs = [b.copy() for b in self.submodels_bs[0]]
-        for b in range(1, self.num_batches):
+        for b in range(1, self.num_subproblems):
             for l in range(len(self.layer_sizes) - 1):
                 self.consensus_Ws[l] += self.submodels_Ws[b][l]
                 self.consensus_bs[l] += self.submodels_bs[b][l]
         for l in range(len(self.layer_sizes) - 1):
-            self.consensus_Ws[l] /= self.num_batches
-            self.consensus_bs[l] /= self.num_batches
+            self.consensus_Ws[l] /= self.num_subproblems
+            self.consensus_bs[l] /= self.num_subproblems
 
         return old_consensus_Ws, old_consensus_bs
 
@@ -460,24 +484,24 @@ class ADMM:
         self.relaxed_submodels_Ws = [
             [alpha * self.submodels_Ws[b][l] + (1.0 - alpha) * old_consensus_Ws[l]
             for l in range(len(self.layer_sizes) - 1)]
-            for b in range(self.num_batches)
+            for b in range(self.num_subproblems)
         ]
         self.relaxed_submodels_bs = [
             [alpha * self.submodels_bs[b][l] + (1.0 - alpha) * old_consensus_bs[l]
             for l in range(len(self.layer_sizes) - 1)]
-            for b in range(self.num_batches)
+            for b in range(self.num_subproblems)
         ]
 
         # consensus = mean of relaxed submodel params
         self.consensus_Ws = [w.copy() for w in self.relaxed_submodels_Ws[0]]
         self.consensus_bs = [b.copy() for b in self.relaxed_submodels_bs[0]]
-        for b in range(1, self.num_batches):
+        for b in range(1, self.num_subproblems):
             for l in range(len(self.layer_sizes) - 1):
                 self.consensus_Ws[l] += self.relaxed_submodels_Ws[b][l]
                 self.consensus_bs[l] += self.relaxed_submodels_bs[b][l]
         for l in range(len(self.layer_sizes) - 1):
-            self.consensus_Ws[l] /= self.num_batches
-            self.consensus_bs[l] /= self.num_batches
+            self.consensus_Ws[l] /= self.num_subproblems
+            self.consensus_bs[l] /= self.num_subproblems
 
         return old_consensus_Ws, old_consensus_bs
 
@@ -500,7 +524,7 @@ class ADMM:
         Uses self.relaxed_submodels_* (the raw solves for mean/loss-weighted; the relaxed θ̂ for
         under-relaxed) so the dual variable retains zero sum.
         '''
-        for b in range(self.num_batches):
+        for b in range(self.num_subproblems):
             for l in range(len(self.layer_sizes) - 1):
                 self.dual_var_Ws[b][l] += (
                     self.admm_penalty_param * (self.relaxed_submodels_Ws[b][l] - self.consensus_Ws[l])
@@ -515,8 +539,8 @@ class ADMM:
         and the total primal residual - sqrt(Σ_b||θ_b^k - θ^k||^2_2) - as tuple
         (total_r_primal, r_primal).
         '''
-        r_primal = np.zeros(self.num_batches) # store per-subproblem primal residuals
-        for b in range(self.num_batches):
+        r_primal = np.zeros(self.num_subproblems) # store per-subproblem primal residuals
+        for b in range(self.num_subproblems):
             for l in range(len(self.layer_sizes) - 1):
                 r_primal[b] += np.linalg.norm(self.submodels_Ws[b][l] - self.consensus_Ws[l]) ** 2
                 r_primal[b] += np.linalg.norm(self.submodels_bs[b][l] - self.consensus_bs[l]) ** 2
@@ -524,13 +548,13 @@ class ADMM:
         return np.sqrt(np.sum(r_primal)), r_primal
 
     def compute_dual_residual(self, consensus_Ws, consensus_bs):
-        '''Returns dual residual - sqrt(B)*rho^k*||(θ^k - θ^{k-1})||_2'''
+        '''Returns dual residual - sqrt(num_subproblems)*rho^k*||(θ^k - θ^{k-1})||_2'''
         s = 0.0
         for l in range(len(self.layer_sizes) - 1):
             s += np.linalg.norm(self.consensus_Ws[l] - consensus_Ws[l]) ** 2
             s += np.linalg.norm(self.consensus_bs[l] - consensus_bs[l]) ** 2
 
-        return np.sqrt(self.num_batches) * self.admm_penalty_param * np.sqrt(s)
+        return np.sqrt(self.num_subproblems) * self.admm_penalty_param * np.sqrt(s)
 
     def compute_combined_residual(self, r_primal, s_dual):
         '''
@@ -551,10 +575,10 @@ class ADMM:
         This is a simple heuristic: if the primal residual is much larger than the dual residual,
         increase the penalty parameter; if the dual residual is much larger, decrease it.
         '''
-        mu = self.mu  # factor to compare primal and dual residuals (routed from constructor)
+        mu = self.adaptive_admm_penalty_mu  # factor to compare primal and dual residuals (routed from constructor)
         tau_incr = 2.0  # factor to increase penalty
         tau_decr = 2.0  # factor to decrease penalty
-        rho_min, rho_max = 0.1, 10  # clamp so residual balancing can't drift rho to extremes
+        rho_min, rho_max = 0.1, 50  # clamp so residual balancing can't drift rho to extremes
 
         if (current_primal_res / current_eps_pri) > mu * (current_dual_res / current_eps_dual):
             new_admm_penalty_param = current_admm_penalty_param * tau_incr
@@ -575,12 +599,12 @@ class ADMM:
           ε_pri = sqrt(B*P) * abs_tol + rel_tol * max[(sum_b||theta_b||_2^2)^0.5, (B*||consensus||_2^2)^0.5]
         Recomputed each ADMM iteration from the current submodel and consensus params.
         '''
-        eps_abs = np.sqrt(self.num_batches * self.num_params) * abs_tol
-        if not self.adaptive_tol_update:
+        eps_abs = np.sqrt(self.num_subproblems * self.num_params) * abs_tol
+        if not self.adaptive_admm_tol:
             return eps_abs
 
-        Ax = np.zeros(self.num_batches)
-        for b in range(self.num_batches):
+        Ax = np.zeros(self.num_subproblems)
+        for b in range(self.num_subproblems):
             for l in range(len(self.layer_sizes) - 1):
                 Ax[b] += (np.linalg.norm(submodels_Ws[b][l]) ** 2)
                 Ax[b] += (np.linalg.norm(submodels_bs[b][l]) ** 2)
@@ -590,7 +614,7 @@ class ADMM:
         for l in range(len(self.layer_sizes) - 1):
             Bz += (np.linalg.norm(consensus_Ws[l]) ** 2)
             Bz += (np.linalg.norm(consensus_bs[l]) ** 2)
-        norm_Bz = np.sqrt(self.num_batches * Bz)
+        norm_Bz = np.sqrt(self.num_subproblems * Bz)
 
         return eps_abs + rel_tol * max(norm_Ax, norm_Bz)
 
@@ -602,12 +626,12 @@ class ADMM:
         Boyd's adaptive dual tolerance, with the abs floor scaled by ρ. 
           ε_dual = sqrt(B*P)*ρ*abs_tol + rel_tol * (sum_b||lambda_b||_2^2)^0.5
         '''
-        eps_abs = np.sqrt(self.num_batches * self.num_params) * self.admm_penalty_param * abs_tol
-        if not self.adaptive_tol_update:
+        eps_abs = np.sqrt(self.num_subproblems * self.num_params) * self.admm_penalty_param * abs_tol
+        if not self.adaptive_admm_tol:
             return eps_abs
 
-        Ay = np.zeros(self.num_batches)
-        for b in range(self.num_batches):
+        Ay = np.zeros(self.num_subproblems)
+        for b in range(self.num_subproblems):
             for l in range(len(self.layer_sizes) - 1):
                 Ay[b] += (np.linalg.norm(dual_var_Ws[b][l]) ** 2)
                 Ay[b] += (np.linalg.norm(dual_var_bs[b][l]) ** 2)
@@ -686,7 +710,7 @@ class ADMM:
         '''
         # record per-iteration objectives, residuals and the ρ value used this iteration
         t_res0 = time.perf_counter()
-        obj_per_batch = np.array([self.submodels_obj[b] for b in range(self.num_batches)])
+        obj_per_batch = np.array([self.submodels_obj[b] for b in range(self.num_subproblems)])
         self.residual_history["primal_avg"].append(float(r_primal))
         self.residual_history["primal_per_batch"].append(r_primal_per_batch.tolist())
         self.residual_history["dual"].append(float(s_dual))
@@ -706,9 +730,9 @@ class ADMM:
             print(f"Combined residual: {combined_res:.6f}" + (" (RESTART)" if restarted else ""))
         if step_size is not None:
             print(f"Step size (alpha): {step_size:.4f}  |  momentum restart: {bool(restarted)}")
-        print("Per-batch primal residuals: "
+        print("Per-subproblem primal residuals: "
                 + np.array2string(r_primal_per_batch, precision=4, max_line_width=np.inf))
-        print("Per-batch subproblem objective: "
+        print("Per-subproblem objective: "
                 + np.array2string(obj_per_batch, precision=4, max_line_width=np.inf))
         t_start += time.perf_counter() - t_res0  # exclude residual calculation from timer
 
@@ -808,7 +832,7 @@ class ADMM:
                 eps_dual = self.update_dual_stopping_condition(
                     admm_abs_tol, admm_rel_tol, self.dual_var_Ws, self.dual_var_bs
                 )
-                if self.adaptive_penalty_update and iteration > 0:
+                if self.adaptive_admm_penalty and iteration > 0:
                     self.admm_penalty_param = self.update_admm_penalty_param(
                         self.admm_penalty_param, r_primal, s_dual, eps_pri, eps_dual
                     )
@@ -890,14 +914,14 @@ class ADMM:
                 for l in range(len(self.layer_sizes) - 1)
             ]
             hat_dual_Ws = [
-                [self.dual_var_Ws[b][l] + beta * (self.dual_var_Ws[b][l] - prev_dual_Ws[b][l]) 
-                for l in range(len(self.layer_sizes) - 1)] 
-                for b in range(self.num_batches)
+                [self.dual_var_Ws[b][l] + beta * (self.dual_var_Ws[b][l] - prev_dual_Ws[b][l])
+                for l in range(len(self.layer_sizes) - 1)]
+                for b in range(self.num_subproblems)
             ]
             hat_dual_bs = [
-                [self.dual_var_bs[b][l] + beta * (self.dual_var_bs[b][l] - prev_dual_bs[b][l]) 
-                for l in range(len(self.layer_sizes) - 1)] 
-                for b in range(self.num_batches)
+                [self.dual_var_bs[b][l] + beta * (self.dual_var_bs[b][l] - prev_dual_bs[b][l])
+                for l in range(len(self.layer_sizes) - 1)]
+                for b in range(self.num_subproblems)
             ]
             restarted = False
         else:
@@ -923,8 +947,8 @@ class ADMM:
             num_convergence_confirmations: int = 3,
             subproblem_warmstart: str = "consensus", 
             consensus_aggregator: str = "mean", # "mean" | "under-relaxed"
-            restart_eta: float = 0.9,  # η ∈ (0,1): restart if c^k ≥ η·c^{k−1}
-            accel_start_iter: int = 25,   # iteration at which Nesterov momentum turns on (0 = from start)
+            fast_admm_restart_eta: float = 0.9,  # η ∈ (0,1): restart if c^k ≥ η·c^{k−1}
+            fast_admm_start_iter: int = 25,   # iteration at which Nesterov momentum turns on (0 = from start)
             training_clock_budget: float = None,
             mse_eval_options: dict = None,
             mse_eval_every: int = 10
@@ -945,7 +969,7 @@ class ADMM:
                     print("WARNING: subproblem_warmstart='relaxed' but consensus_aggregator is not "
                           "'under-relaxed' -> relaxed params are not maintained; warm start falls back to "
                           "'previous' (own last solve).")
-        if self.adaptive_penalty_update:
+        if self.adaptive_admm_penalty:
             raise ValueError("adaptive ρ is disabled under Fast ADMM")
 
         iteration_count = 0
@@ -955,8 +979,8 @@ class ADMM:
         # previous non-accelerated iterate z^k/λ^k, kept as the Nesterov extrapolation base
         prev_plain_consensus_Ws = [w.copy() for w in self.consensus_Ws]
         prev_plain_consensus_bs = [b.copy() for b in self.consensus_bs]
-        prev_dual_Ws = [[w.copy() for w in self.dual_var_Ws[b]] for b in range(self.num_batches)]
-        prev_dual_bs = [[b.copy() for b in self.dual_var_bs[b]] for b in range(self.num_batches)]
+        prev_dual_Ws = [[w.copy() for w in self.dual_var_Ws[b]] for b in range(self.num_subproblems)]
+        prev_dual_bs = [[b.copy() for b in self.dual_var_bs[b]] for b in range(self.num_subproblems)]
 
         t_start = time.perf_counter()
         try:
@@ -990,7 +1014,7 @@ class ADMM:
                 # z^k so record_and_check's MSE eval (and a break / the final eval) use it.
                 combined_res, restarted = None, False
                 next_consensus_Ws = next_consensus_bs = next_dual_Ws = next_dual_bs = None
-                if iteration_count > accel_start_iter:
+                if iteration_count > fast_admm_start_iter:
                     (step_size, combined_res,
                      next_consensus_Ws, next_consensus_bs,
                      next_dual_Ws, next_dual_bs,
@@ -1000,7 +1024,7 @@ class ADMM:
                         prev_dual_Ws, prev_dual_bs,
                         old_combined_res,
                         step_size,
-                        restart_eta
+                        fast_admm_restart_eta
                     )
                     old_combined_res = combined_res
                 iteration_count += 1
@@ -1021,8 +1045,8 @@ class ADMM:
                 # roll prev -> current non-accelerated z^{k+1}/λ^{k+1}, THEN apply the extrapolation for the next iter
                 prev_plain_consensus_Ws = [w.copy() for w in self.consensus_Ws]
                 prev_plain_consensus_bs = [b.copy() for b in self.consensus_bs]
-                prev_dual_Ws = [[w.copy() for w in self.dual_var_Ws[b]] for b in range(self.num_batches)]
-                prev_dual_bs = [[b.copy() for b in self.dual_var_bs[b]] for b in range(self.num_batches)]
+                prev_dual_Ws = [[w.copy() for w in self.dual_var_Ws[b]] for b in range(self.num_subproblems)]
+                prev_dual_bs = [[b.copy() for b in self.dual_var_bs[b]] for b in range(self.num_subproblems)]
                 # skip the extrapolation write on the final iteration so the definitive final eval
                 # (and the deployed model) always uses the plain iterate z^k, like the break paths
                 if next_consensus_Ws is not None and iteration < max_admm_iterations - 1:

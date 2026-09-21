@@ -21,24 +21,31 @@ class NODEPyomo:
             state_lower_bound: float, state_upper_bound: float,
             param_lower_bound: float, param_upper_bound: float,
             l2_reg_param: float,
-            admm_submodel: bool = False,
+            admm_submodel: bool = True,
             admm_penalty_param: float = None,
             transcription_method: str = 'dc',
             irrdc_param: float = None,
             num_res_eval_nodes: int = None,
-            obs_times: np.ndarray = None
+            obs_times: np.ndarray = None,
+            seed: int = None
     ):
-        self.num_colloc_nodes, self.state_dim = Y_obs.shape
-        if Y_obs.ndim != 2:
+        self.rng = np.random.default_rng(seed) # if seed = None -> nondeterministic; int -> reproducible
+        if Y_obs.ndim != 3:
             raise ValueError(
-                f"Y_obs must be 2D (num_colloc_nodes, state_dim); got {Y_obs.shape}."
+                f"Y_obs must be 3D (num_traj, num_colloc_nodes, state_dim); got {Y_obs.shape}. "
+                f"A single trajectory should be passed with a leading axis of length 1."
             )
+        self.num_traj, self.num_colloc_nodes, self.state_dim = Y_obs.shape
         if self.state_dim > self.num_colloc_nodes:
             warnings.warn(
                 f"Y_obs should be structured such that each row represents a new collocation point."
             )
         self.end_time = end_time
-
+        if transcription_method == 'irrdc' and self.num_traj > 1:
+            raise ValueError(
+                "Multi-trajectory subproblems (num_traj > 1) are only supported for "
+                "transcription_method='dc'; got 'irrdc'."
+            )
         bary = BarycentricInterpolation(
             0, self.end_time,
             self.num_colloc_nodes,
@@ -47,16 +54,22 @@ class NODEPyomo:
         )
         self.colloc_grid = bary.colloc_grid # (num_colloc_nodes,)
         self.bary_ws = bary.bary_ws
-        self.D_colloc = bary.D_colloc # (num_colloc_nodes, num_colloc_nodes)
+        self.D_colloc = bary.D_colloc # (num_colloc_nodes, num_colloc_nodes) local block
+        self.total_nodes = self.num_traj * self.num_colloc_nodes
 
-        # align Y_obs to the collocation grid (if not already)
+        # Align each trajectory onto the collocation grid (if obs_times given), then stack the
+        # trajectories (total_nodes, state_dim) array indexed by a global node index
+        # (num_traj=1 recovers the single-trajectory 2D behaviour).
         if obs_times is not None:
             obs_times = np.asarray(obs_times)
             if obs_times.shape[0] != self.num_colloc_nodes:
-                raise ValueError("obs_times length must match the number of Y_obs rows.")
-            self.Y_obs = CubicSpline(obs_times, Y_obs, axis=0)(self.colloc_grid).astype(Y_obs.dtype) # trade-off here?
+                raise ValueError("obs_times length must match the number of Y_obs collocation nodes.")
+            Y_seg = np.empty((self.num_traj, self.num_colloc_nodes, self.state_dim), dtype=float)
+            for s in range(self.num_traj):
+                Y_seg[s] = CubicSpline(obs_times, Y_obs[s], axis=0)(self.colloc_grid)
         else:
-            self.Y_obs = Y_obs
+            Y_seg = np.asarray(Y_obs, dtype=float)
+        self.Y_obs = Y_seg.reshape(self.total_nodes, self.state_dim)
 
         self.layer_sizes = layer_sizes
         self.model = pyo.ConcreteModel()
@@ -90,16 +103,16 @@ class NODEPyomo:
 
     def initialise_weight(self, shape):
         '''Xavier initialisation of a weight matrix as pyomo Var'''
-        W = np.random.randn(*shape) * np.sqrt(2 / (shape[0] + shape[1]))
+        W = self.rng.standard_normal(shape) * np.sqrt(2 / (shape[0] + shape[1]))
         def init_rule(model, i, j):
             return W[i-1, j-1] # W is a 0-indexed ndarray 
         return init_rule
     
     def initialise_bias(self, shape):
-        '''Normal random initialisation of a bias vector as pyomo Var'''
-        b = np.random.randn(*shape) * 0.1
+        '''Zero initialisation of a bias vector as pyomo Var'''
+        b = np.zeros(shape)
         def init_rule(model, i, j):
-            return b[0, i-1] # b is a 0-indexed ndarray 
+            return b[0, i-1] # b is a 0-indexed ndarray
         return init_rule
     
     def initialise_colloc_diff_matrix(self):
@@ -123,21 +136,30 @@ class NODEPyomo:
     def initialise_Y_star(self):
         '''Initialisation of the approximate state trajectory Y_star as a pyomo Var using smooth data.'''
         def init_rule(model, m, d):
-            return self.Y_obs[m-1, d-1] + np.random.randn() * 0.1 # self.Y_obs is a 0-indexed ndarray
+            return self.Y_obs[m-1, d-1] # self.Y_obs is a 0-indexed ndarray
         return init_rule
     
     def local_dc_objective_rule(self, model):
         '''
-        Underlying DC objective as a pyomo expression, without the ADMM consensus penalty - 
-        (1/N) * ||Y_star - Y_obs||_F^2 + Λ * ||θ||_2^2.
+        Underlying DC objective as a pyomo expression, without the ADMM consensus penalty -
+        sum_s (1/N) * ||Y_star_s - Y_obs_s||_F^2 + Λ * ||θ||_2^2.
+
+        The misfit is the per-trajectory DC misfit (1/N)||.||_F^2 summed over the num_traj
+        trajectories stitched block-diagonally into this subproblem (num_traj=1 recovers the
+        single-trajectory objective). The L2 term is added ONCE: θ is shared across all
+        trajectories in the subproblem.
         '''
-        # MSE term: (1/N) * ||Y_star - Y_obs||_F^2
-        mse = (1 / self.num_colloc_nodes) * sum(
-            (model.Y_star[n, d] - self.Y_obs[n-1, d-1])**2
-            for n in model.n
-            for d in model.d
+        N = self.num_colloc_nodes
+        # MSE term: sum over trajectories of (1/N) * ||Y_star_s - Y_obs_s||_F^2
+        mse = sum(
+            (1 / N) * sum(
+                (model.Y_star[s0 * N + n, d] - self.Y_obs[s0 * N + n - 1, d-1])**2
+                for n in model.nloc
+                for d in model.d
+            )
+            for s0 in range(self.num_traj)
         )
-        # Reg L2 norm term: Λ * ||Θ||_2^2
+        # Reg L2 norm term: Λ * ||Θ||_2^2 (θ shared across trajectories -> counted once)
         l2_norm = sum(
             model.Ws[l].W[i, j]**2
             for l in model.l
@@ -186,8 +208,9 @@ class NODEPyomo:
 
         # ------------ SETS ------------
         self.model.l = pyo.RangeSet(len(self.layer_sizes) - 1) # [1:len(self.layer_sizes)-1] as for n layers, have n-1 W matrices/b vectors
-        self.model.n = pyo.RangeSet(self.num_colloc_nodes) 
-        self.model.d = pyo.RangeSet(self.state_dim) 
+        self.model.n = pyo.RangeSet(self.total_nodes)          # ALL collocation nodes across every trajectory
+        self.model.nloc = pyo.RangeSet(self.num_colloc_nodes)  # local node index within a trajectory
+        self.model.d = pyo.RangeSet(self.state_dim)
         self.model.m = pyo.RangeSet(self.num_res_eval_nodes) if self.transcription_method == 'irrdc' else None
 
         # ----- DECISION VARIABLES -----
@@ -219,29 +242,40 @@ class NODEPyomo:
                 bounds=(self.param_lower_bound, self.param_upper_bound)
             )
 
-        #------ INITIAL CONDITION CONSTRAINT ------
+        #------ INITIAL CONDITION CONSTRAINTS (one per trajectory) ------
+        # Each trajectory's first node (global index offset+1, offset = s0*N) is pinned to that
+        # trajectory's initial condition.
         self.model.initial_condition = pyo.ConstraintList()
-        for d in self.model.d:
-            self.model.initial_condition.add(self.model.Y_star[1, d] == self.Y_obs[0, d-1])
-        
+        for s0 in range(self.num_traj):
+            offset = s0 * self.num_colloc_nodes
+            for d in self.model.d:
+                self.model.initial_condition.add(self.model.Y_star[offset + 1, d] == self.Y_obs[offset, d-1])
+
         # --------- COLLOCATION CONSTRAINT --------
-        # Initialise the collocation-estimated differentiation matrix as a pyomo Param
+        # Local (per-trajectory) collocation differentiation block as a pyomo Param (N x N); it is
+        # the diagonal block repeated for every trajectory in the block-diagonal operator.
         self.model.D_colloc = pyo.Param(
-            self.model.n,  
-            self.model.n, 
-            domain=pyo.Reals, 
+            self.model.nloc,
+            self.model.nloc,
+            domain=pyo.Reals,
             initialize=self.initialise_colloc_diff_matrix()
         )
 
-        # Define LHS of ODE_colloc (dY_star/dt) as matrix of pyomo expressions 
-        self.model.ode_lhs_colloc = pyo.Expression( 
-            self.model.n, 
-            self.model.d, 
-            rule=lambda model, n, d: sum(self.model.Y_star[j, d] * self.model.D_colloc[n, j] for j in model.n) 
+        # Define LHS of ODE_colloc (dY_star/dt) as matrix of pyomo expressions -- BLOCK DIAGONAL:
+        # the derivative at a global node uses ONLY its own trajectory's nodes.
+        def ode_lhs_colloc_rule(model, g, d):
+            s0 = (g - 1) // self.num_colloc_nodes      # trajectory (0-indexed)
+            nloc = (g - 1) % self.num_colloc_nodes + 1 # local node within the trajectory (1-indexed)
+            offset = s0 * self.num_colloc_nodes
+            return sum(self.model.Y_star[offset + j, d] * self.model.D_colloc[nloc, j] for j in model.nloc)
+        self.model.ode_lhs_colloc = pyo.Expression(
+            self.model.n,
+            self.model.d,
+            rule=ode_lhs_colloc_rule
         )
 
-        # Compute output of NN for collocation points as a ndarray of Pyomo expressions 
-        nn_output_colloc = self.nn_feedforward_pyo(self.model.Y_star, self.num_colloc_nodes) # (num_colloc_nodes, state_dim) ndarray of pyomo expressions
+        # Compute output of NN for collocation points as a ndarray of Pyomo expressions
+        nn_output_colloc = self.nn_feedforward_pyo(self.model.Y_star, self.total_nodes) # (total_nodes, state_dim) ndarray of pyomo expressions
 
         #----- INTEGRATED RESIDUAL OBJECTIVE -------
         if self.transcription_method == 'irrdc':
@@ -341,11 +375,14 @@ class NODEPyomo:
             self.model.obj = pyo.Objective(rule=lambda m: self.irrdc_objective_rule(m, nn_output_res), sense=pyo.minimize)
 
     def build_constraints(self, nn_output_colloc):
-        # Define ODE equality constraint: dY_star/dt = NN(Y_star)
+        # Define ODE equality constraint: dY_star/dt = NN(Y_star), block-diagonal over trajectories.
+        # Skip each trajectory's first node (its initial condition is already enforced).
         self.model.ode = pyo.ConstraintList()
-        for n in range(2, self.num_colloc_nodes + 1): # skip n=1 (initial condition already enforced)
+        for g in range(1, self.total_nodes + 1):
+            if (g - 1) % self.num_colloc_nodes == 0:
+                continue # first node of a trajectory -> initial condition, skip
             for d in self.model.d:
-                self.model.ode.add(self.model.ode_lhs_colloc[n, d] == nn_output_colloc[n-1, d-1])
+                self.model.ode.add(self.model.ode_lhs_colloc[g, d] == nn_output_colloc[g-1, d-1])
 
 
     # ----------------------------------- TRAINING METHODS ----------------------------------- #
@@ -461,9 +498,15 @@ class NODEPyomo:
     
     # ------------------------------ DIAGNOSTIC & MISC METHODS ------------------------------- #
 
-    def pyomo_var_to_numpy(self, pyo_obj, shape): 
+    def pyomo_var_to_numpy(self, pyo_obj, shape):
         '''Copy pyo_obj (a Pyomo Var/Param/Expression) into a numpy ndarray.'''
         return np.array([[pyo.value(pyo_obj[i, j]) for j in range(1, shape[1]+1)] for i in range(1, shape[0]+1)])
+
+    def convert_weights(self):
+        return [self.pyomo_var_to_numpy(self.model.Ws[l].W, (self.layer_sizes[l-1], self.layer_sizes[l])) for l in self.model.l]
+
+    def convert_biases(self):
+        return [self.pyomo_var_to_numpy(self.model.bs[l].b, (1, self.layer_sizes[l])) for l in self.model.l]
     
     def check_param_values(self):
         '''Print summary statistics for NN parameters.'''

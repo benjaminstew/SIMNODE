@@ -83,6 +83,11 @@ def parse_args():
         help="Which test trajectory to plot (0-based, into that B's test_batch_ids).",
     )
     parser.add_argument(
+        "--repeat", type=int, default=0,
+        help="Which repeat of this B to plot (0-based; default 0). Each repeat has its own fitted "
+             "params and its own training subset (the test set is fixed across repeats).",
+    )
+    parser.add_argument(
         "--models", nargs="+", choices=list(MODEL_ORDER), default=None, metavar="MODEL",
         help=f"Which models to overlay (default: all present). Choose from: {', '.join(MODEL_ORDER)}.",
     )
@@ -116,9 +121,16 @@ def main():
         available = ", ".join(sorted((k for k in results if k.lstrip('-').isdigit()), key=int))
         raise SystemExit(f"B={args.B} not in results. Available B: {available}")
 
-    entry = results[B_key]
+    reps = results[B_key]
+    rep_key = str(args.repeat)
+    if not isinstance(reps, dict) or rep_key not in reps:
+        avail = ", ".join(sorted((r for r in reps if str(r).lstrip('-').isdigit()), key=int)) \
+            if isinstance(reps, dict) else "(none)"
+        raise SystemExit(f"repeat {args.repeat} not found for B={args.B}. Available repeats: {avail}")
+    entry = reps[rep_key]
     if "error" in entry:
-        raise SystemExit(f"B={args.B} recorded a training error, nothing to plot: {entry['error']}")
+        raise SystemExit(f"B={args.B} repeat={args.repeat} recorded a training error, "
+                         f"nothing to plot: {entry['error']}")
 
     trained_params = entry.get("trained_params", {})
     if not trained_params:
@@ -156,7 +168,7 @@ def main():
     true_traj = batch_df[state_cols].values # (N, D)
     y0 = true_traj[0]
 
-    print(f"Plotting B={args.B}, test Batch_{test_bid} (test index {ti}); "
+    print(f"Plotting B={args.B}, repeat={args.repeat}, test Batch_{test_bid} (test index {ti}); "
           f"models: {', '.join(models_to_plot)}")
 
     # --- predictions from stored params ---
@@ -196,7 +208,7 @@ def main():
     fig.tight_layout(rect=(0, 0, 1, 0.97))
 
     model_tag = "-".join(models_to_plot)
-    out_path = args.plots_path / f"predicted_vs_true_B={args.B}_batch={test_bid}_{model_tag}.png"
+    out_path = args.plots_path / f"predicted_vs_true_B={args.B}_r={args.repeat}_batch={test_bid}_{model_tag}.png"
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
     print(f"wrote {out_path}")

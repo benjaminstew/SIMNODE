@@ -42,6 +42,7 @@ class NODEPyomo:
             obs_times: np.ndarray, 
             seed: int = None
     ):
+        self.rng = np.random.default_rng(seed) # if seed = None -> nondeterministic; int -> reproducible
         self.Y_obs = Y_obs
         if self.Y_obs.ndim != 3:
             raise ValueError(
@@ -53,7 +54,6 @@ class NODEPyomo:
         self.obs_times = obs_times
         if self.obs_times.shape[0] != self.num_colloc_nodes:
             raise ValueError("obs_times length must match Y_obs.shape[1] (num_colloc_nodes).")
-
         self.end_time = end_time
         self.layer_sizes = layer_sizes
         if self.layer_sizes[0] != self.state_dim or self.layer_sizes[-1] != self.state_dim:
@@ -66,13 +66,10 @@ class NODEPyomo:
         self.param_lower_bound = param_lower_bound
         self.param_upper_bound = param_upper_bound
         self.transcription_method = 'dc'
-        if seed is not None:
-            np.random.seed(seed)
 
         # Single collocation grid shared by every segment.
         # The full block-diagonal differentiation matrix is this N x N grid repeated once per
-        # segment; we store only the block and offset by segment when indexing (efficient -- a
-        # dense (B*N) x (B*N) matrix would be almost all zeros).
+        # segment; we store only the block and offset by segment when indexing the global node index.
         bary = BarycentricInterpolation(0, self.end_time, self.num_colloc_nodes, transcription_method='dc')
         self.colloc_grid = bary.colloc_grid # (N,) ascending, colloc_grid[0] == 0
         self.bary_ws = bary.bary_ws
@@ -89,21 +86,19 @@ class NODEPyomo:
         self.build_model()
 
     # ------------------------------ BASE MODEL BUILDING METHODS ------------------------------- #
-    #  initialise_colloc_diff_matrix builds the LOCAL block; initialise_Y_star
-    #  reads the stacked data.
 
     def initialise_weight(self, shape):
         '''Xavier initialisation of a weight matrix as pyomo Var'''
-        W = np.random.randn(*shape) * np.sqrt(2 / (shape[0] + shape[1]))
+        W = self.rng.standard_normal(shape) * np.sqrt(2 / (shape[0] + shape[1]))
         def init_rule(model, i, j):
             return W[i-1, j-1]  # W is a 0-indexed ndarray
         return init_rule
 
     def initialise_bias(self, shape):
-        '''Normal random initialisation of a bias vector as pyomo Var'''
-        b = np.random.randn(*shape) * 0.1
+        '''Zero initialisation of a bias vector as pyomo Var'''
+        b = np.zeros(shape)
         def init_rule(model, i, j):
-            return b[0, i-1]  # b is a 0-indexed ndarray
+            return b[0, i-1] # b is a 0-indexed ndarray
         return init_rule
 
     def initialise_colloc_diff_matrix(self):
@@ -118,7 +113,7 @@ class NODEPyomo:
         '''Initialisation of the approximate state trajectory Y_star as a pyomo Var using the
         (resampled, stacked) data plus small noise (matches node_pyomo_admm.py's Y_star init).'''
         def init_rule(model, g, d):
-            return self.Y_obs[g-1, d-1] + np.random.randn() * 0.1  # self.Y_obs is a 0-indexed ndarray
+            return self.Y_obs[g-1, d-1] 
         return init_rule
 
     def single_traj_objective_rule(self, model, s0):

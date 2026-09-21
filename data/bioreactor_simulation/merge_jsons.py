@@ -22,19 +22,26 @@ for f in files:
         data = json.load(fh)
     if config is None:
         config = data.get("config", {})
-    for k, v in data.get("results", {}).items():
-        if k not in merged_results:
-            merged_results[k] = v
-        else:
-            # prefer whichever entry has more data (not just an error stub)
-            existing_has_data = "error" not in merged_results[k]
-            new_has_data = "error" not in v
-            if new_has_data and not existing_has_data:
-                merged_results[k] = v
+    # New schema: results[<B>][<repeat>] = {entry}. Merge at the (B, repeat) level, preferring
+    # whichever repeat entry actually has data over an error stub.
+    for B, reps in data.get("results", {}).items():
+        dst = merged_results.setdefault(B, {})
+        if not isinstance(reps, dict):
+            continue
+        for r, entry in reps.items():
+            new_has_data = isinstance(entry, dict) and "error" not in entry
+            existing = dst.get(r)
+            existing_has_data = isinstance(existing, dict) and "error" not in existing
+            if r not in dst or (new_has_data and not existing_has_data):
+                dst[r] = entry
 
-# Sort by integer B
-sorted_results = {k: merged_results[k]
-                  for k in sorted(merged_results, key=lambda x: int(x))}
+# Sort by integer B, and each B's repeats by integer repeat index.
+def _sorted_by_int(d):
+    return {k: d[k] for k in sorted(d, key=lambda x: int(x))}
+
+sorted_results = {B: (_sorted_by_int(merged_results[B]) if isinstance(merged_results[B], dict)
+                      else merged_results[B])
+                  for B in sorted(merged_results, key=lambda x: int(x))}
 
 out = {"config": config or {}, "results": sorted_results}
 out_path.parent.mkdir(parents=True, exist_ok=True)

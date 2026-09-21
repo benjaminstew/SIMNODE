@@ -25,6 +25,7 @@ from pathlib import Path
 
 import numpy as np
 import matplotlib.pyplot as plt
+from scipy.stats import t as student_t
 
 # ------------------------------- STYLE -------------------------------
 MODEL_LABELS = {
@@ -76,6 +77,12 @@ def parse_args():
              "Ignored by the across-B scaling plots.",
     )
     parser.add_argument(
+        "--repeat", type=int, default=0, metavar="R",
+        help="For the per-iteration ADMM plots, which repeat's history to plot (default 0). "
+             "Iteration counts differ across repeats, so these plots show one repeat rather than "
+             "an aggregate. Ignored by the across-B scaling plots (those aggregate over all repeats).",
+    )
+    parser.add_argument(
         "--stop-band", type=float, default=NEAR_STOPPING_BAND, metavar="MULT",
         help="Convergence acceptance region shaded on the residual plots is (residual <= MULT * eps). "
              "Mirrors the ADMM solver's near_stopping_band; it is not stored in the sweep JSON, so set "
@@ -106,74 +113,110 @@ def sorted_B_keys(results):
     """Return the results keys sorted by integer B (skipping malformed ones)."""
     return sorted((k for k in results if str(k).lstrip("-").isdigit()), key=int)
 
+def repeat_entries(results, B_key):
+    """Per-repeat entry dicts for a given B, sorted by repeat index, skipping error/malformed ones.
+
+    New schema: results[<B>][<repeat>] = {entry}. This helper is the single place that descends
+    into the repeat level, so the rest of the module stays repeat-agnostic.
+    """
+    reps = results.get(B_key, {})
+    if not isinstance(reps, dict):
+        return []
+    out = []
+    for rk in sorted((k for k in reps if str(k).lstrip("-").isdigit()), key=int):
+        e = reps[rk]
+        if isinstance(e, dict) and "error" not in e:
+            out.append(e)
+    return out
+
+def mean_std_ci(vals, confidence=0.95):
+    """(mean, std, lo, hi, n) across a list of per-repeat scalars, or None if none are finite.
+
+    std is the sample standard deviation (ddof=1); (lo, hi) is the two-sided `confidence` CI on the
+    mean using the Student-t distribution (appropriate for the small n of a repeat sweep). With n=1
+    the std is 0 and the CI collapses to the mean (no ribbon drawn).
+    """
+    a = np.asarray([v for v in vals if v is not None and np.isfinite(v)], dtype=float)
+    n = a.size
+    if n == 0:
+        return None
+    mean = float(a.mean())
+    if n == 1:
+        return mean, 0.0, mean, mean, 1
+    std = float(a.std(ddof=1))
+    sem = std / np.sqrt(n)
+    half = float(student_t.ppf(0.5 + confidence / 2.0, df=n - 1)) * sem
+    return mean, std, mean - half, mean + half, n
+
 def models_present(results):
-    """Union of model keys that appear in any B's final_mses, in canonical order."""
+    """Union of model keys that appear in any repeat's final_mses, in canonical order."""
     seen = set()
-    for entry in results.values():
-        seen.update(entry.get("final_mses", {}).keys())
+    for B_key in results:
+        for entry in repeat_entries(results, B_key):
+            seen.update(entry.get("final_mses", {}).keys())
     return [m for m in MODEL_ORDER if m in seen]
 
 
 # ------------------------------- SCALING PLOTS -------------------------------
 def _scaling_series(results, keys, kind):
-    """Per-model (xs, ys, lo, hi) series. kind in {'test_mse','train_mse','walltime'}.
+    """Per-model (xs, ys, lo, hi, sd, nmax) aggregated ACROSS REPEATS. kind in
+    {'test_mse','train_mse','walltime'}.
 
-    final_mses[m] = {train, test, test_std, test_min, test_max}. For kind='test_mse', lo/hi carry
-    the mean ± 1 std spread across test trajectories; where std is absent (e.g. seq, or non-test
-    kinds) lo/hi fall back to ys so no ribbon is drawn for that point.
+    For each B we collect one scalar per repeat (final test/train MSE, or wall-clock time), then
+    report ys=mean across repeats, (lo,hi)=95% CI on that mean (Student-t), sd=sample std across
+    repeats. nmax is the largest per-B repeat count seen (for the legend / title). With a single
+    repeat the CI collapses to the mean, so no ribbon is drawn.
     """
     series = {}
+    nmax = 0
     for m in models_present(results):
-        xs, ys, los, his = [], [], [], []
+        xs, ys, los, his, sds = [], [], [], [], []
         for k in keys:
-            entry = results[k]
-            lo = hi = None
-            if kind == "walltime":
-                v = entry.get("train_runtimes", {}).get(m)
-            else:
-                d = entry.get("final_mses", {}).get(m)
-                if not isinstance(d, dict):
-                    v = None
-                elif kind == "test_mse":
-                    v = d.get("test")
-                    sd = d.get("test_std")
-                    if v is not None and sd is not None and np.isfinite(sd):
-                        lo, hi = v - sd, v + sd          # preferred: mean ± 1 std
-                    else:
-                        lo, hi = d.get("test_min"), d.get("test_max")  # fall back to [min, max]
-                else:  # train_mse
-                    v = d.get("train")
-            if v is not None and np.isfinite(v):
-                xs.append(entry["B"])
-                ys.append(float(v))
-                lo_ok = lo is not None and np.isfinite(lo)
-                hi_ok = hi is not None and np.isfinite(hi)
-                los.append(float(lo) if lo_ok else float(v))
-                his.append(float(hi) if hi_ok else float(v))
+            entries = repeat_entries(results, k)
+            vals, B = [], None
+            for entry in entries:
+                B = entry.get("B", int(k))
+                if kind == "walltime":
+                    v = entry.get("train_runtimes", {}).get(m)
+                else:
+                    d = entry.get("final_mses", {}).get(m)
+                    v = (d.get("test") if kind == "test_mse" else d.get("train")) \
+                        if isinstance(d, dict) else None
+                if v is not None and np.isfinite(v):
+                    vals.append(float(v))
+            stats = mean_std_ci(vals)
+            if stats is not None:
+                mean, sd, lo, hi, n = stats
+                nmax = max(nmax, n)
+                xs.append(int(k) if B is None else B)
+                ys.append(mean); los.append(lo); his.append(hi); sds.append(sd)
         if xs:
             series[m] = (np.array(xs, float), np.array(ys, float),
-                         np.array(los, float), np.array(his, float))
-    return series
+                         np.array(los, float), np.array(his, float), np.array(sds, float))
+    return series, nmax
 
 def plot_scaling(results, kind, ylabel, title, out_path):
     keys = sorted_B_keys(results)
-    series = _scaling_series(results, keys, kind)
+    series, nmax = _scaling_series(results, keys, kind)
     fig, ax = plt.subplots(figsize=(7.5, 5))
-    for m, (xs, ys, lo, hi) in series.items():
+    ci_label_used = False
+    for m, (xs, ys, lo, hi, sd) in series.items():
         ax.plot(xs, ys, marker="o", markersize=4, linewidth=1.6,
                 color=MODEL_COLOURS[m], label=MODEL_LABELS[m])
-        # For test MSE, shade a mean ± 1 std ribbon across test trajectories where recorded.
-        if kind == "test_mse" and np.any((hi > ys) | (lo < ys)):
-            # clip the lower edge to a positive floor so the log axis can render it
+        # Shade the 95% CI (across repeats) ribbon wherever it is non-degenerate (n >= 2).
+        if np.any(hi > lo):
             pos = ys[ys > 0]
-            floor = float(pos.min()) * 1e-2 if pos.size else 1e-12
+            floor = float(pos.min()) * 1e-2 if pos.size else 1e-12  # keep lower edge positive for log axis
             ax.fill_between(xs, np.clip(lo, floor, None), hi,
-                            color=MODEL_COLOURS[m], alpha=0.15, linewidth=0)
+                            color=MODEL_COLOURS[m], alpha=0.15, linewidth=0,
+                            label=(None if ci_label_used else "95% CI across repeats"))
+            ci_label_used = True
     ax.set_xlabel("Number of training trajectories, B")
     ax.set_ylabel(ylabel)
-    ax.set_title(title)
+    suffix = f"  (mean of {nmax} repeats)" if nmax > 1 else ""
+    ax.set_title(title + suffix)
     if series:  # log y only makes sense with data present and positive
-        if all(np.all(ys > 0) for _, ys, _, _ in series.values()):
+        if all(np.all(ys > 0) for _, ys, _, _, _ in series.values()):
             ax.set_yscale("log")
         ax.legend()
     fig.tight_layout()
@@ -367,17 +410,24 @@ def main():
                       f"{', '.join(missing)} (available: {', '.join(all_B)})")
             want = [b for b in want if b in results]
 
+        rep_key = str(args.repeat)
         for k in want:
-            entry = results[k]
+            reps = results[k]
+            if not isinstance(reps, dict) or rep_key not in reps:
+                avail = ", ".join(sorted((r for r in reps if str(r).lstrip("-").isdigit()), key=int)) \
+                    if isinstance(reps, dict) else "(none)"
+                print(f"skipping B={k}: repeat {args.repeat} not found (available: {avail})")
+                continue
+            entry = reps[rep_key]
             B = entry.get("B", k)
             if "error" in entry:
-                print(f"skipping B={B}: recorded training error ({entry['error']})")
+                print(f"skipping B={B} repeat={args.repeat}: recorded training error ({entry['error']})")
                 continue
             for kind in iter_selected:
-                out_path = out_dir / f"{kind}_vs_iter_B={B}.png"
+                out_path = out_dir / f"{kind}_vs_iter_B={B}_r={args.repeat}.png"
                 wrote = plot_iter_metric(entry, B, kind, out_path, stop_band=args.stop_band)
                 if not wrote:
-                    print(f"skipping {kind} for B={B}: no ADMM history for this metric")
+                    print(f"skipping {kind} for B={B} repeat={args.repeat}: no ADMM history for this metric")
 
     print("Done.")
 

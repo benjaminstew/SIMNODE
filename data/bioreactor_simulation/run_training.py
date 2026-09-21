@@ -6,12 +6,11 @@ trajectories, with three interchangeable training algorithms:
 -- sequential Neural ODE baseline (PyTorch / torchdiffeq)          -> method key 'seq'
 -- monolithic collocation model (Pyomo/IPOPT, block-diagonal DC)   -> method key 'mono'
 
-main() trains each enabled model on the same train/test split and returns the per-model
-wall-clock training times, MSE histories and residuals. 
+run_training() trains each enabled model on a single pre-built train/test split (passed in as arrays)
+and returns the per-model training metrics.
 """
 import time
 import numpy as np
-import pandas as pd
 import torch
 
 from src.models.simultaneous.admm_mp import ADMM
@@ -19,78 +18,58 @@ from src.models.simultaneous.node_pyomo_monolithic import NODEPyomo as Monolithi
 from src.models.sequential.node_torch_multitraj import train_sequential_multitraj
 
 def run_training(
-    data_path: str,
-    state_cols: list,
+    Y_obs: np.ndarray, # training trajectories, (B, N, D)
+    train_grid: np.ndarray, # training time grid, (N,)
+    Y_test_obs: np.ndarray, # test trajectories, (num_test, N, D)
+    test_grid: np.ndarray, # test time grid, (N,)
     nn_layer_sizes: list,
-    num_train_trajectories: int,
-    num_test_trajectories: int,
-    seed: int,
+    model_init_seed: int, # per-(split_seed, repeat) seed; shared by mono/admm/seq for identical init
     run_admm_baseline: bool = True,
     consensus_aggregator="under-relaxed", # "mean" | "under-relaxed"
+    relaxation_alpha: float = 0.5, # relaxation weight α (θ̂ = α·θ + (1-α)·z)
+    relaxation_start_iter: int = 25, # iter after which under-relaxed aggregation activates
     subproblem_warmstart="consensus", # "consensus" | "relaxed" | "previous"
-    fast_admm: bool = False, # run Goldstein 2014 Fast ADMM (Alg 8) instead of standard ADMM
-    restart_eta: float = 0.9, # Fast ADMM restart threshold η (only used when fast_admm)
-    accel_start_iter: int = 25, # Fast ADMM: iter at which momentum turns on (only used when fast_admm)
-    relaxation_alpha: float = 0.5, # under-relaxation weight α (θ̂ = α·θ + (1-α)·z); α<1 damps spikes
-    relaxation_start_iter: int = 10, # iter after which under-relaxed aggregation activates
+    fast_admm: bool = False, # run Goldstein Fast ADMM instead of standard Boyd ADMM
+    fast_admm_restart_eta: float = None, # Fast ADMM restart threshold η
+    fast_admm_start_iter: int = None, # Fast ADMM: iter at which momentum turns on
     warmstart_start_iter: int = 25, # iter after which subproblem warm start activates
-    adaptive_rho: bool = True, # adaptive ρ via Boyd residual balancing; fast_admm forces fixed ρ
-    mu: float = 3.0, # adaptive-ρ residual-balancing factor μ
-    hyperparam_printer=None,
+    adaptive_admm_penalty: bool = False, # adaptive ρ via Boyd residual balancing; fast_admm forces fixed ρ
+    num_batches_per_subp: int = 1, # num trajectories stitched block-diagonally into each ADMM subproblem (K)
+    admm_warm_init: bool = False, # ADMM: False -> cold per-worker Xavier init (seeded); True -> batch-0 warmup solve
+    hyperparam_table=None,
     run_sequential_baseline: bool = False,
     run_monolithic_baseline: bool = True,
     return_models: bool = True
 ) -> dict:
     """
-    Train the models on one train/test split and return their metrics.
+    Train the models on one pre-built train/test split and return their metrics.
 
     Args:
-        seed: seeds the train/test split (and the torch baseline) for reproducibility.
+        Y_obs, train_grid: training trajectories (B, N, D) and their shared time grid (N,).
+        Y_test_obs, test_grid: held-out test trajectories (num_test, N, D) and their time grid (N,).
+        model_init_seed: seeds every model's weight init so mono/admm/seq start from the same point.
 
     Returns:
         dict {
-          'train_batch_ids': [...],
-          'test_batch_ids': [...],
           'train_runtimes': {method: wall_clock_seconds},
           'mse_histories':  {method: {train_mse: [...], test_mse: [...], ...}},
           'residual_histories': {admm: {primal_avg: [...], dual: [...], rho: [...], ...}},
           'objective_histories': {admm: {obj_per_batch: [...], ...}},
           'final_mses': {method: {train, test, test_std, test_min, test_max}},  # std/range = per-test-traj spread
-          # the following are added only when return_models=True:
+          # when return_models=True:
           'trained_models': {method: fitted model object},
           'test_grid': [...], 'Y_test_obs': ndarray, 'train_grid': [...], 'Y_obs': ndarray,
         }
     """
-    print(f"Using layer sizes: {nn_layer_sizes} (num_train={num_train_trajectories}, num_test={num_test_trajectories})")
-
-    rng = np.random.default_rng(seed)
-
-    # -------------------- SETUP --------------------
-    df = pd.read_csv(data_path)
-    all_batch_ids = sorted(int(b.split('_')[1]) for b in df['Batch'].unique())
-    if num_train_trajectories + num_test_trajectories > len(all_batch_ids):
-        raise ValueError(
-            f"num_train + num_test = {num_train_trajectories + num_test_trajectories} exceeds the number of available "
-            f"trajectories ({len(all_batch_ids)}) in {data_path}."
-        )
-    chosen = rng.choice(all_batch_ids, size=num_train_trajectories + num_test_trajectories, replace=False)
-    train_batch_ids = sorted(int(x) for x in chosen[:num_train_trajectories])
-    test_batch_ids = sorted(int(x) for x in chosen[num_train_trajectories:num_train_trajectories + num_test_trajectories])
-    train_batches = {bid: df[df['Batch'] == f"Batch_{bid}"].reset_index(drop=True) for bid in train_batch_ids}
-    test_batches = {bid: df[df['Batch'] == f"Batch_{bid}"].reset_index(drop=True) for bid in test_batch_ids}
-
-    train_grid = train_batches[train_batch_ids[0]]['Time'].values
-    Y_obs = np.array([train_batches[bid][state_cols].values for bid in train_batch_ids]) # (B, N, D)
-    test_grid = test_batches[test_batch_ids[0]]['Time'].values
-    Y_test_obs = np.array([test_batches[bid][state_cols].values for bid in test_batch_ids]) # (num_test, N, D)
+    num_train_trajectories = Y_obs.shape[0]
+    num_test_trajectories = Y_test_obs.shape[0]
+    print(f"Using layer sizes: {nn_layer_sizes} (num_train_trajs={num_train_trajectories}, num_test_trajs={num_test_trajectories})")
     end_time = train_grid[-1]
-
-    # per-iteration training metric recording 
     dt = train_grid[1] - train_grid[0]
     mse_eval_options = {
         "train_grid": train_grid,
         "Y_obs": Y_obs,
-        "test_grid": test_grid, 
+        "test_grid": test_grid,
         "Y_test_obs": Y_test_obs,
         "rtol": 1e-7,
         "atol": 1e-9,
@@ -109,7 +88,7 @@ def run_training(
     }
 
 
-    # ---------------- 1. ADMM consensus collocation model (DC) ----------------
+    # ---------------------------- 1. ADMM consensus collocation model (DC) -------------------------------
     if run_admm_baseline:
         # softer tolerances / fewer IPOPT iterations for the first `num_early_iterations` ADMM
         # iterations (subproblems are far from consensus early on -> tight solves are wasted)
@@ -127,51 +106,55 @@ def run_training(
             "acceptable_iter": 15
         }
         admm_config = dict(
-            Y_obs=Y_obs,                   
+            Y_obs=Y_obs,
             layer_sizes=nn_layer_sizes,
             end_time=end_time,
-            obs_times=train_grid,               
+            obs_times=train_grid,
             state_lower_bound=-5,
             state_upper_bound=50,
             param_lower_bound=-10,
             param_upper_bound=10,
             l2_reg_param=1e-4,
             use_pool=True,
-            warm_init=True,
-            adaptive_penalty_update=(adaptive_rho and not fast_admm), # fast ADMM forces fixed ρ; else honour adaptive_rho
-            mu=mu,                                                    # adaptive-ρ residual-balancing factor μ
-            adaptive_tol_update=True,
+            admm_warm_init=admm_warm_init,
+            seed=model_init_seed, # master seed -> per-worker cold-init child seeds
+            adaptive_admm_penalty=(adaptive_admm_penalty and not fast_admm), # fast ADMM forces fixed ρ; else honour adaptive_admm_penalty
+            adaptive_admm_penalty_mu=3.0, # adaptive-ρ residual balancing factor 
+            num_batches_per_subp=num_batches_per_subp, # trajectories per ADMM subproblem (K)
+            adaptive_admm_tol=True,
             transcription_method='dc',
             irrdc_param=None,
             num_res_eval_nodes=None,
-            relaxation_alpha=relaxation_alpha,           # under-relaxation weight α
-            relaxation_start_iter=relaxation_start_iter, # iter under-relaxation activates
-            warmstart_start_iter=warmstart_start_iter    # iter subproblem warm start activates
+            relaxation_alpha=relaxation_alpha, # relaxation weight α
+            relaxation_start_iter=relaxation_start_iter, # iter relaxation activates
+            warmstart_start_iter=warmstart_start_iter # iter subproblem warm start activates
         )
-
         admm_training_options = dict(
             early_solver_options=admm_early_solver_options,
             late_solver_options=admm_late_solver_options,
-            admm_abs_tol=5e-4,   # ε_abs (per-parameter absolute floor)
-            admm_rel_tol=1e-3,   # ε_rel (Boyd-recommended 1e-3..1e-4)
+            admm_abs_tol=5e-4, # ε_abs (per-parameter absolute floor)
+            admm_rel_tol=1e-3, # ε_rel (Boyd-recommended 1e-3..1e-4)
             max_admm_iterations=2000,
             num_early_iterations=20, # opening iters using early_solver_options
             num_convergence_confirmations=2, # consecutive sub-tol iters before stopping (Boyd: 1)
-            near_stopping_band=1.5,  # early stop when residuals sit within this x eps
+            near_stopping_band=1.5, # early stop when residuals sit within this x eps
             training_clock_budget=60, # minutes; None = no wall-clock cap
             consensus_aggregator=consensus_aggregator,
             subproblem_warmstart=subproblem_warmstart,
             mse_eval_options=mse_eval_options,
             mse_eval_every=10 # evaluate/record prediction MSE every N ADMM iters (raise to cut eval wall-clock)
         )
-        if hyperparam_printer is not None:
-            hyperparam_printer(admm_config, admm_training_options, fast_admm, restart_eta, accel_start_iter)
+        if hyperparam_table is not None:
+            hyperparam_table(admm_config, admm_training_options, fast_admm, fast_admm_restart_eta, fast_admm_start_iter)
         admm = ADMM(**admm_config)
         if fast_admm:
             # Fast ADMM keeps the chosen consensus_aggregator (mean or under-relaxed) and adds the restart params
             fast_admm_training_options = dict(admm_training_options)
-            fast_admm_training_options["restart_eta"] = restart_eta
-            fast_admm_training_options["accel_start_iter"] = accel_start_iter
+            # only override the solver defaults when explicitly provided (avoid passing None)
+            if fast_admm_restart_eta is not None:
+                fast_admm_training_options["fast_admm_restart_eta"] = fast_admm_restart_eta
+            if fast_admm_start_iter is not None:
+                fast_admm_training_options["fast_admm_start_iter"] = fast_admm_start_iter
             print("\n\nTraining Fast ADMM consensus model (DC, Goldstein 2014 Alg 8) ...\n\n")
             admm.run_fast_admm_training(**fast_admm_training_options)
         else:
@@ -181,7 +164,6 @@ def run_training(
         mse_histories['admm'] = admm.mse_history
         residual_histories['admm'] = admm.residual_history
         objective_histories['admm'] = admm.objective_history
-        # Final MSEs from the definitive final eval (mean + per-test-trajectory range).
         final_mses['admm'] = {
             "train": admm.final_train_mse,
             "test": admm.final_test_mse,
@@ -194,7 +176,7 @@ def run_training(
         print(f"{method_labels['admm']} training time: {train_runtimes['admm']:.1f}s")
 
 
-    # ---------------- 2. Sequential Neural ODE baseline (PyTorch) ----------------
+    # ---------------------------- 2. Sequential Neural ODE baseline (PyTorch) -------------------------------
     if run_sequential_baseline:
         print("\n\nTraining sequential Neural ODE baseline ...\n\n")
         Y_obs_t = torch.tensor(Y_obs, dtype=torch.float32)
@@ -223,7 +205,7 @@ def run_training(
             eval_rtol=1e-3,
             eval_atol=1e-6,
             device="cpu",
-            seed=seed,
+            seed=model_init_seed,
             verbose=True,
             log_every=50
         )
@@ -238,7 +220,8 @@ def run_training(
         }
         print(f"{method_labels['seq']} training time: {train_runtimes['seq']:.1f}s")
 
-    # ---------------- 3. Monolithic collocation model (block-diagonal DC) ----------------
+
+    # ---------------------------- 3. Monolithic collocation model (block-diagonal DC) ----------------
     if run_monolithic_baseline:
         monolithic_solver_options = {
             "max_iter": 1000,
@@ -255,7 +238,7 @@ def run_training(
             state_lower_bound=-5, state_upper_bound=50,
             param_lower_bound=-50, param_upper_bound=50,
             l2_reg_param=1e-4,
-            seed=seed
+            seed=model_init_seed
         )
         t0 = time.perf_counter()
         mono.solve_model(monolithic_solver_options)
@@ -282,8 +265,8 @@ def run_training(
         print(f"{method_labels['mono']} training time: {train_runtimes['mono']:.1f}s")
 
 
-    # ---------------- TRAINING SUMMARY TABLE ----------------
-    n_pred = len(train_batch_ids) + len(test_batch_ids)
+    # ------------------------------------- TRAINING OUTPUT SUMMARY TABLE -----------------------------------
+    n_pred = num_train_trajectories + num_test_trajectories
     print("\n" + "=" * 92)
     print(f"Training summary (num_train={num_train_trajectories}, num_test={num_test_trajectories}, {n_pred} trajectories)")
     print("Final MSE = model MSE after convergence or wall-clock budget elapsed")
@@ -296,17 +279,13 @@ def run_training(
             test_mse = mses.get('test', float('nan'))
             print(f"{method_labels[m]:<32}{train_runtimes[m]:>12.2f}{train_mse:>22.6e}{test_mse:>22.6e}")
     print("=" * 92 + "\n")
-
     result = {
-        "train_batch_ids": train_batch_ids,
-        "test_batch_ids": test_batch_ids,
         "train_runtimes": train_runtimes,
         "mse_histories": mse_histories,
         "residual_histories": residual_histories,
         "final_mses": final_mses,
         "objective_histories": objective_histories,
     }
-    
     if return_models:
         # fitted model objects + the arrays needed to plot predicted vs true trajectories
         result["trained_models"] = trained_models
@@ -316,4 +295,3 @@ def run_training(
         result["Y_obs"] = Y_obs
 
     return result
-

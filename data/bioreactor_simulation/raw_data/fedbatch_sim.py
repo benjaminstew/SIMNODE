@@ -285,7 +285,7 @@ if __name__ == "__main__":
     #   - 30 time points per batch (Delta t = 1/29 over [0, 1])
     #   - no feeds (with_feed=False -> no G_Feed column, exactly 30 rows/batch)
     #   - trailing Noise_Level_ID and Noise_Level columns
-    N_BATCH = 200
+    N_BATCH = 150
     N_TIME_POINTS = 30
     NOISE_LEVEL_ID = 1
     EPS = 0.0  # lowest noise setting
