@@ -8,6 +8,7 @@ __pycache__/
 environment.yml
 environment_isambard.yml
 ipopt.opt
-./data/bioreactor_simulation/run_scaling_sweep.pbs
-./data/bioreactor_simulation/run_scaling_sweep.slurm
-./data/bioreactor_simulation/merge_jsons.py
+data/bioreactor_simulation/*.slurm
+data/bioreactor_simulation/*.pbs
+data/bioreactor_simulation/merge_jsons.py
+data/bioreactor_simulation/plot_*
