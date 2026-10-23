@@ -81,4 +81,4 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    plot_trajectory(args.csv, num_trajs=args.num_trajs, save=args.save, seed=args.seed)
+    plot_trajectory(args.csv, num_trajs=args.num_trajs, save=args.save, seed=0)

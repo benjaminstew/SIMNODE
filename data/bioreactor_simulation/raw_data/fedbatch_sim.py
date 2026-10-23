@@ -280,19 +280,13 @@ class FedBatchSim:
 
 if __name__ == "__main__":
     import os
-
-    # Match the format of the existing raw_data CSVs:
-    #   - 30 time points per batch (Delta t = 1/29 over [0, 1])
-    #   - no feeds (with_feed=False -> no G_Feed column, exactly 30 rows/batch)
-    #   - trailing Noise_Level_ID and Noise_Level columns
-    N_BATCH = 150
+    N_BATCH = 10000
     N_TIME_POINTS = 30
-    NOISE_LEVEL_ID = 1
-    EPS = 0.0  # lowest noise setting
+    EPS = 0.005  # lowest noise setting
 
     out_dir = os.path.dirname(os.path.abspath(__file__))
     out_path = os.path.join(
-        out_dir, f"noise_level_{NOISE_LEVEL_ID:02d}_eps{EPS}_n{N_BATCH}.csv"
+        out_dir, f"{N_BATCH}trajectories_{N_TIME_POINTS}points_{EPS}noise.csv"
     )
 
     sim = FedBatchSim()  # no seed -> output differs each run
@@ -302,7 +296,6 @@ if __name__ == "__main__":
         with_feed=False,
         eps=EPS,
     )
-    df["Noise_Level_ID"] = NOISE_LEVEL_ID
     df["Noise_Level"] = EPS
 
     df.to_csv(out_path, index=False)

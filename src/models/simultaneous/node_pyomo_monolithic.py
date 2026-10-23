@@ -284,10 +284,10 @@ class NODEPyomo:
         # set up IPOPT solver 
         solver = pyo.SolverFactory("ipopt", executable="/usr/local/bin/ipopt")
 
-        solver.options['max_iter'] = solver_options["max_iter"]
-        solver.options['tol'] = solver_options["tol"]
-        solver.options['acceptable_tol'] = solver_options["acceptable_tol"]
-        solver.options['acceptable_iter'] = solver_options["acceptable_iter"]
+        # Every key in solver_options is forwarded to IPOPT (max_iter, tol, acceptable_*, print_level, ...);
+        # everything else is read from the option file below - don't also set a solver_options key there.
+        for key, value in solver_options.items():
+            solver.options[key] = value
         repo_root = Path(__file__).resolve().parents[3]  # .../CNODE
         option_path = repo_root / "ipopt.opt"
         if not option_path.exists():
@@ -301,7 +301,7 @@ class NODEPyomo:
         # judged from the solver status / termination condition, NOT len(result.solution).
         result = None
         try:
-            result = solver.solve(self.model, tee=False, load_solutions=True)
+            result = solver.solve(self.model, tee=True, load_solutions=True)
             tc = result.solver.termination_condition
             solution_loaded = (
                 result.solver.status in (SolverStatus.ok, SolverStatus.warning)

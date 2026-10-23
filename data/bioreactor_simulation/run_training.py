@@ -25,16 +25,23 @@ def run_training(
     nn_layer_sizes: list,
     model_init_seed: int, # per-(split_seed, repeat) seed; shared by mono/admm/seq for identical init
     run_admm_baseline: bool = True,
-    consensus_aggregator="under-relaxed", # "mean" | "under-relaxed"
-    relaxation_alpha: float = 0.5, # relaxation weight α (θ̂ = α·θ + (1-α)·z)
-    relaxation_start_iter: int = 25, # iter after which under-relaxed aggregation activates
-    subproblem_warmstart="consensus", # "consensus" | "relaxed" | "previous"
-    fast_admm: bool = False, # run Goldstein Fast ADMM instead of standard Boyd ADMM
-    fast_admm_restart_eta: float = None, # Fast ADMM restart threshold η
-    fast_admm_start_iter: int = None, # Fast ADMM: iter at which momentum turns on
+    consensus_aggregator="relaxed", # "mean" | "relaxed"
+    relaxation_alpha: float = 1.5, # relaxation weight α (θ̂ = α·θ + (1-α)·z)
+    relaxation_start_iter: int = 25, # iter after which relaxed aggregation activates
+    subproblem_warmstart = "consensus", # "consensus" | "relaxed" | "previous"
     warmstart_start_iter: int = 25, # iter after which subproblem warm start activates
-    adaptive_admm_penalty: bool = False, # adaptive ρ via Boyd residual balancing; fast_admm forces fixed ρ
+    adaptive_admm_penalty: bool = False, # adaptive ρ via Boyd residual balancing
+    rho_max: float = 50, # upper clamp on the adaptive ρ
+    late_mu_init: float = 0.1, # IPOPT initial barrier parameter for the late ADMM subproblem solves (0.1 = IPOPT default)
     num_batches_per_subp: int = 1, # num trajectories stitched block-diagonally into each ADMM subproblem (K)
+    num_subproblems: int = None, # if set, overrides ceil(B / K): split the B trajectories evenly into this many subproblems
+    l2_reg_param: float = 1e-3, # L2 regularisation weight ν on the NN params; shared by ADMM + monolithic
+    param_bound: float = 10, # box bound |θ| <= param_bound on every NN param; shared by ADMM + monolithic
+    transcription_method: str = 'dc', # 'dc' | 'irrdc' (DC + integrated-residual penalty); ADMM only
+    irrdc_param: float = None, # IRR-DC: residual penalty weight μ, term is (1/(2μ)) * ∫||r||^2 (larger μ = weaker)
+    num_res_eval_nodes: int = None, # IRR-DC: size of the equidistant residual-evaluation grid on [0, T]
+    training_clock_budget=60, # ADMM wall-clock cap in minutes; None -> no cap (run to max_admm_iterations)
+    max_admm_iterations: int = 2000, # ADMM: hard cap on the number of consensus iterations
     admm_warm_init: bool = False, # ADMM: False -> cold per-worker Xavier init (seeded); True -> batch-0 warmup solve
     hyperparam_table=None,
     run_sequential_baseline: bool = False,
@@ -64,6 +71,23 @@ def run_training(
     num_train_trajectories = Y_obs.shape[0]
     num_test_trajectories = Y_test_obs.shape[0]
     print(f"Using layer sizes: {nn_layer_sizes} (num_train_trajs={num_train_trajectories}, num_test_trajs={num_test_trajectories})")
+
+    # ---- transcription-method validation (IRR-DC is only implemented in the ADMM submodel) ----
+    if transcription_method not in ('dc', 'irrdc'):
+        raise ValueError(f"transcription_method must be 'dc' or 'irrdc'; got {transcription_method!r}.")
+    if transcription_method == 'irrdc':
+        if irrdc_param is None or num_res_eval_nodes is None:
+            raise ValueError("transcription_method='irrdc' requires both irrdc_param and num_res_eval_nodes.")
+        # The ADMM submodel's residual block is single-trajectory only: it rejects num_traj > 1.
+        multi_traj_subp = (num_subproblems is not None and num_subproblems < num_train_trajectories) \
+            or (num_subproblems is None and num_batches_per_subp > 1)
+        if run_admm_baseline and multi_traj_subp:
+            raise ValueError(
+                "transcription_method='irrdc' is only supported with one trajectory per ADMM subproblem "
+                "(num_batches_per_subp=1 and no subproblem-size rule)."
+            )
+        if run_monolithic_baseline:
+            print("WARNING: the monolithic model has no IRR-DC implementation; the 'mono' baseline is trained as plain DC.")
     end_time = train_grid[-1]
     dt = train_grid[1] - train_grid[0]
     mse_eval_options = {
@@ -83,7 +107,7 @@ def run_training(
     trained_models = {}
     method_labels = {
         'mono': 'monolithic (DC)',
-        'admm': 'ADMM consensus (DC)',
+        'admm': f"ADMM consensus ({transcription_method.upper()})",
         'seq': 'sequential (torchdiffeq)',
     }
 
@@ -93,17 +117,18 @@ def run_training(
         # softer tolerances / fewer IPOPT iterations for the first `num_early_iterations` ADMM
         # iterations (subproblems are far from consensus early on -> tight solves are wasted)
         admm_early_solver_options = {
-            "max_iter": 200,
+            "max_iter": 50,
             "tol": 1e-4,
             "acceptable_tol": 1e-3,
-            "acceptable_iter": 10
+            "print_level": 0  
         }
         # standard tolerances for the remaining ADMM iterations
         admm_late_solver_options = {
-            "max_iter": 1000,
+            "max_iter": 3000,
             "tol": 1e-6,
             "acceptable_tol": 1e-5,
-            "acceptable_iter": 15
+            "mu_init": late_mu_init,  # early solves keep IPOPT's default mu_init
+            "print_level": 0
         }
         admm_config = dict(
             Y_obs=Y_obs,
@@ -112,19 +137,22 @@ def run_training(
             obs_times=train_grid,
             state_lower_bound=-5,
             state_upper_bound=50,
-            param_lower_bound=-10,
-            param_upper_bound=10,
-            l2_reg_param=1e-4,
+            param_lower_bound=-param_bound,
+            param_upper_bound=param_bound,
+            l2_reg_param=l2_reg_param,
             use_pool=True,
             admm_warm_init=admm_warm_init,
             seed=model_init_seed, # master seed -> per-worker cold-init child seeds
-            adaptive_admm_penalty=(adaptive_admm_penalty and not fast_admm), # fast ADMM forces fixed ρ; else honour adaptive_admm_penalty
-            adaptive_admm_penalty_mu=3.0, # adaptive-ρ residual balancing factor 
+            adaptive_admm_penalty=adaptive_admm_penalty, # adaptive ρ via residual balancing (else fixed at admm_penalty_init)
+            admm_penalty_init=1.0, # initial ρ (constant for all T and S)
+            adaptive_admm_penalty_mu=3, # adaptive-ρ residual balancing factor
+            adaptive_admm_penalty_max=rho_max, # adaptive-ρ upper clamp
             num_batches_per_subp=num_batches_per_subp, # trajectories per ADMM subproblem (K)
+            num_subproblems=num_subproblems, # None -> ceil(B / K); else overrides K
             adaptive_admm_tol=True,
-            transcription_method='dc',
-            irrdc_param=None,
-            num_res_eval_nodes=None,
+            transcription_method=transcription_method, # 'dc' | 'irrdc'
+            irrdc_param=irrdc_param, # IRR-DC residual penalty weight μ (None for 'dc')
+            num_res_eval_nodes=num_res_eval_nodes, # IRR-DC residual-grid size (None for 'dc')
             relaxation_alpha=relaxation_alpha, # relaxation weight α
             relaxation_start_iter=relaxation_start_iter, # iter relaxation activates
             warmstart_start_iter=warmstart_start_iter # iter subproblem warm start activates
@@ -134,32 +162,21 @@ def run_training(
             late_solver_options=admm_late_solver_options,
             admm_abs_tol=5e-4, # ε_abs (per-parameter absolute floor)
             admm_rel_tol=1e-3, # ε_rel (Boyd-recommended 1e-3..1e-4)
-            max_admm_iterations=2000,
-            num_early_iterations=20, # opening iters using early_solver_options
-            num_convergence_confirmations=2, # consecutive sub-tol iters before stopping (Boyd: 1)
-            near_stopping_band=1.5, # early stop when residuals sit within this x eps
-            training_clock_budget=60, # minutes; None = no wall-clock cap
+            max_admm_iterations=max_admm_iterations,
+            num_early_iterations=5, # opening iters using early_solver_options
+            num_convergence_confirmations=3, # consecutive sub-tol iters before stopping (Boyd: 1)
+            near_stopping_band=1.0, # early stop when residuals sit within this x eps
+            training_clock_budget=training_clock_budget, # minutes; None = no wall-clock cap
             consensus_aggregator=consensus_aggregator,
             subproblem_warmstart=subproblem_warmstart,
             mse_eval_options=mse_eval_options,
             mse_eval_every=10 # evaluate/record prediction MSE every N ADMM iters (raise to cut eval wall-clock)
         )
         if hyperparam_table is not None:
-            hyperparam_table(admm_config, admm_training_options, fast_admm, fast_admm_restart_eta, fast_admm_start_iter)
+            hyperparam_table(admm_config, admm_training_options)
         admm = ADMM(**admm_config)
-        if fast_admm:
-            # Fast ADMM keeps the chosen consensus_aggregator (mean or under-relaxed) and adds the restart params
-            fast_admm_training_options = dict(admm_training_options)
-            # only override the solver defaults when explicitly provided (avoid passing None)
-            if fast_admm_restart_eta is not None:
-                fast_admm_training_options["fast_admm_restart_eta"] = fast_admm_restart_eta
-            if fast_admm_start_iter is not None:
-                fast_admm_training_options["fast_admm_start_iter"] = fast_admm_start_iter
-            print("\n\nTraining Fast ADMM consensus model (DC, Goldstein 2014 Alg 8) ...\n\n")
-            admm.run_fast_admm_training(**fast_admm_training_options)
-        else:
-            print("\n\nTraining ADMM consensus model (DC) ...\n\n")
-            admm.run_admm_training(**admm_training_options)
+        print(f"\n\nTraining ADMM consensus model ({transcription_method.upper()}) ...\n\n")
+        admm.run_admm_training(**admm_training_options)
         train_runtimes['admm'] = admm.train_runtime
         mse_histories['admm'] = admm.mse_history
         residual_histories['admm'] = admm.residual_history
@@ -224,10 +241,11 @@ def run_training(
     # ---------------------------- 3. Monolithic collocation model (block-diagonal DC) ----------------
     if run_monolithic_baseline:
         monolithic_solver_options = {
-            "max_iter": 1000,
+            "max_iter": 3000,
             "tol": 1e-8,
             "acceptable_tol": 1e-7,
-            "acceptable_iter": 15
+            "acceptable_iter": 15,
+            "print_level": 5  # full IPOPT iteration table in the job log (solve is run with tee=True)
         }
         print("\n\nTraining monolithic Pyomo baseline ...\n\n")
         mono = MonolithicNODEPyomo(
@@ -236,8 +254,8 @@ def run_training(
             layer_sizes=nn_layer_sizes,
             end_time=end_time,
             state_lower_bound=-5, state_upper_bound=50,
-            param_lower_bound=-50, param_upper_bound=50,
-            l2_reg_param=1e-4,
+            param_lower_bound=-param_bound, param_upper_bound=param_bound,
+            l2_reg_param=l2_reg_param,
             seed=model_init_seed
         )
         t0 = time.perf_counter()

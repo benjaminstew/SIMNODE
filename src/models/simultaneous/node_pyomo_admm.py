@@ -139,15 +139,17 @@ class NODEPyomo:
             return self.Y_obs[m-1, d-1] # self.Y_obs is a 0-indexed ndarray
         return init_rule
     
-    def local_dc_objective_rule(self, model):
+    def dc_objective_rule(self, model):
         '''
-        Underlying DC objective as a pyomo expression, without the ADMM consensus penalty -
-        sum_s (1/N) * ||Y_star_s - Y_obs_s||_F^2 + Λ * ||θ||_2^2.
+        Returns the DC objective function as a pyomo expression -
+        sum_s (1/N) * ||Y_star_s - Y_obs_s||_F^2 + T_s * Λ * ||θ||_2^2 [+ ADMM consensus penalty].
 
-        The misfit is the per-trajectory DC misfit (1/N)||.||_F^2 summed over the num_traj
+        The misfit is the per-trajectory DC misfit (1/N)||.||_F^2 summed over the T_s = num_traj
         trajectories stitched block-diagonally into this subproblem (num_traj=1 recovers the
-        single-trajectory objective). The L2 term is added ONCE: θ is shared across all
-        trajectories in the subproblem.
+        single-trajectory objective). The L2 term is weighted by T_s so the S subproblem
+        regularisers sum to B*Λ*||θ||^2 at consensus, matching the monolithic objective (which
+        carries Λ*||θ||^2 per trajectory). For an ADMM submodel the consensus penalty
+        (ρ/2) * ||θ - θ_consensus + (1/ρ) * λ||_2^2 is added.
         '''
         N = self.num_colloc_nodes
         # MSE term: sum over trajectories of (1/N) * ||Y_star_s - Y_obs_s||_F^2
@@ -159,7 +161,7 @@ class NODEPyomo:
             )
             for s0 in range(self.num_traj)
         )
-        # Reg L2 norm term: Λ * ||Θ||_2^2 (θ shared across trajectories -> counted once)
+        # Reg L2 norm term: T_s * Λ * ||Θ||_2^2 (one Λ per trajectory in the subproblem)
         l2_norm = sum(
             model.Ws[l].W[i, j]**2
             for l in model.l
@@ -170,11 +172,8 @@ class NODEPyomo:
             for l in model.l
             for j in range(1, self.layer_sizes[l] + 1)
         )
+        reg_mse = mse + self.num_traj * self.l2_reg_param * l2_norm
 
-        return mse + self.l2_reg_param * l2_norm
-
-    def dc_objective_rule(self, model):
-        '''Returns the DC objective function as a pyomo expression.'''
         if self.admm_submodel:
             # ADMM consensus penalty term: (ρ/2) * ||θ - θ_consensus + (1/ρ) * λ||_2^2
             consensus_penalty = (model.admm_penalty_param / 2) * (sum(
@@ -187,9 +186,9 @@ class NODEPyomo:
                 for l in model.l
                 for j in range(1, self.layer_sizes[l] + 1)
             ))
-            return model.local_dc_objective + consensus_penalty
-        
-        return model.local_dc_objective
+            return reg_mse + consensus_penalty
+
+        return reg_mse
     
     def irrdc_objective_rule(self, model, nn_output_res):
         '''Returns the objective function for IRR-DC'''
@@ -357,10 +356,6 @@ class NODEPyomo:
                     mutable=True
                 )
 
-        # Named Expression for the underlying DC objective (mse + l2 reg, no ADMM consensus
-        # penalty), so it can be extracted from model after each solve.
-        self.model.local_dc_objective = pyo.Expression(rule=lambda m: self.local_dc_objective_rule(m))
-
         # Build Pyomo objective function based on transcription method
         self.build_objective(nn_output_res)
 
@@ -429,13 +424,12 @@ class NODEPyomo:
         # set up IPOPT solver
         solver = pyo.SolverFactory("ipopt", executable="/usr/local/bin/ipopt")
         
-        # Numeric run limits (not in the option file) come from solver_options; all other IPOPT
-        # settings (linear_solver, nlp scaling, mu_strategy, print_level, HSL lib, ...) are read
-        # from the option file in the repo root (CNODE/ipopt.opt).
-        solver.options['max_iter'] = solver_options["max_iter"]
-        solver.options['tol'] = solver_options["tol"]
-        solver.options['acceptable_tol'] = solver_options["acceptable_tol"]
-        solver.options['acceptable_iter'] = solver_options["acceptable_iter"]
+        # Every key in solver_options is forwarded to IPOPT (max_iter, tol, acceptable_*, mu_init, ...);
+        # a misspelt key makes IPOPT fail loudly. Everything else (linear_solver, nlp scaling,
+        # mu_strategy, print_level, HSL lib, ...) is read from the option file in the repo root
+        # (CNODE/ipopt.opt) - don't also set a solver_options key there.
+        for key, value in solver_options.items():
+            solver.options[key] = value
         repo_root = Path(__file__).resolve().parents[3]  # .../CNODE
         option_path = repo_root / "ipopt.opt"
         if not option_path.exists():
@@ -479,8 +473,6 @@ class NODEPyomo:
             # unloaded solve leaves warm-start params in the model, so an ungated read would
             # report the warm-start objective, not a real solve result.
             "objective": float(pyo.value(self.model.obj)) if solution_loaded else float("nan"),
-            # Underlying DC objective (mse + l2 reg), without the ADMM consensus penalty.
-            "local_dc_objective": float(pyo.value(self.model.local_dc_objective)) if solution_loaded else float("nan"),
         }
 
         if solution_loaded:
