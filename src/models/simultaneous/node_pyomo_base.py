@@ -1,9 +1,10 @@
-'''
-currently lacks customisation on:
-- the numerical analysis methods used, 
-- interpolation scheme used, 
+"""
+The base simultaneous NODE model implemented in Pyomo, trained on a single trajectory with IPOPT. 
+Currently lacks customisation on:
+- the numerical solver used for prediction, 
+- discretisation scheme used (only barycentric lagrange so far), 
 - param initialisation methods, etc...
-'''
+"""
 import warnings
 import numpy as np 
 import time
@@ -11,7 +12,7 @@ from pathlib import Path
 from scipy.integrate import solve_ivp
 import pyomo.environ as pyo
 from pyomo.opt import SolverStatus, TerminationCondition
-from src.models.simultaneous.direct_collocation import BarycentricInterpolation
+from src.models.simultaneous.barycentric_lagrange_collocation import BarycentricInterpolation
 
 class NODEPyomo:
     """

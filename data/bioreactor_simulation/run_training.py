@@ -4,7 +4,7 @@ trajectories, with three interchangeable training algorithms:
 
 -- ADMM-based consensus collocation model (Pyomo/IPOPT, DC)        -> method key 'admm'
 -- sequential Neural ODE baseline (PyTorch / torchdiffeq)          -> method key 'seq'
--- monolithic collocation model (Pyomo/IPOPT, block-diagonal DC)   -> method key 'mono'
+-- monolithic collocation model (Pyomo/IPOPT, block-diagonal DC/IRR-DC) -> method key 'mono'
 
 run_training() trains each enabled model on a single pre-built train/test split (passed in as arrays)
 and returns the per-model training metrics.
@@ -37,7 +37,7 @@ def run_training(
     num_subproblems: int = None, # if set, overrides ceil(B / K): split the B trajectories evenly into this many subproblems
     l2_reg_param: float = 1e-3, # L2 regularisation weight ν on the NN params; shared by ADMM + monolithic
     param_bound: float = 10, # box bound |θ| <= param_bound on every NN param; shared by ADMM + monolithic
-    transcription_method: str = 'dc', # 'dc' | 'irrdc' (DC + integrated-residual penalty); ADMM only
+    transcription_method: str = 'dc', # 'dc' | 'irrdc' (DC + integrated-residual penalty); shared by ADMM + monolithic
     irrdc_param: float = None, # IRR-DC: residual penalty weight μ, term is (1/(2μ)) * ∫||r||^2 (larger μ = weaker)
     num_res_eval_nodes: int = None, # IRR-DC: size of the equidistant residual-evaluation grid on [0, T]
     training_clock_budget=60, # ADMM wall-clock cap in minutes; None -> no cap (run to max_admm_iterations)
@@ -72,7 +72,7 @@ def run_training(
     num_test_trajectories = Y_test_obs.shape[0]
     print(f"Using layer sizes: {nn_layer_sizes} (num_train_trajs={num_train_trajectories}, num_test_trajs={num_test_trajectories})")
 
-    # ---- transcription-method validation (IRR-DC is only implemented in the ADMM submodel) ----
+    # ---- transcription-method validation (ADMM IRR-DC subproblems are single-trajectory only) ----
     if transcription_method not in ('dc', 'irrdc'):
         raise ValueError(f"transcription_method must be 'dc' or 'irrdc'; got {transcription_method!r}.")
     if transcription_method == 'irrdc':
@@ -86,8 +86,6 @@ def run_training(
                 "transcription_method='irrdc' is only supported with one trajectory per ADMM subproblem "
                 "(num_batches_per_subp=1 and no subproblem-size rule)."
             )
-        if run_monolithic_baseline:
-            print("WARNING: the monolithic model has no IRR-DC implementation; the 'mono' baseline is trained as plain DC.")
     end_time = train_grid[-1]
     dt = train_grid[1] - train_grid[0]
     mse_eval_options = {
@@ -106,7 +104,7 @@ def run_training(
     objective_histories = {}
     trained_models = {}
     method_labels = {
-        'mono': 'monolithic (DC)',
+        'mono': f"monolithic ({transcription_method.upper()})",
         'admm': f"ADMM consensus ({transcription_method.upper()})",
         'seq': 'sequential (torchdiffeq)',
     }
@@ -238,7 +236,7 @@ def run_training(
         print(f"{method_labels['seq']} training time: {train_runtimes['seq']:.1f}s")
 
 
-    # ---------------------------- 3. Monolithic collocation model (block-diagonal DC) ----------------
+    # ---------------------------- 3. Monolithic collocation model (block-diagonal DC/IRR-DC) ----------------
     if run_monolithic_baseline:
         monolithic_solver_options = {
             "max_iter": 3000,
@@ -256,7 +254,10 @@ def run_training(
             state_lower_bound=-5, state_upper_bound=50,
             param_lower_bound=-param_bound, param_upper_bound=param_bound,
             l2_reg_param=l2_reg_param,
-            seed=model_init_seed
+            seed=model_init_seed,
+            transcription_method=transcription_method, # 'dc' | 'irrdc'
+            irrdc_param=irrdc_param, # IRR-DC residual penalty weight μ (None for 'dc')
+            num_res_eval_nodes=num_res_eval_nodes # IRR-DC residual-grid size (None for 'dc')
         )
         t0 = time.perf_counter()
         mono.solve_model(monolithic_solver_options)

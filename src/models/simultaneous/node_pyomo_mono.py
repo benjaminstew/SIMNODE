@@ -1,18 +1,7 @@
 """
-Monolithic collocation-based Neural ODE over B independent trajectories.
-
-- Stitching = BLOCK DIAGONAL. Every trajectory keeps its own 
-    collocation grid, its own initial-condition constraint, and its own collocation ODE
-    constraints. The collocation derivative at a node depends ONLY on nodes within the
-    same segment, so there is no spurious coupling across trajectory boundaries -- the
-    trajectories are independent experiments each with their own initial condition. (This
-    is the centralized fixed point that consensus ADMM targets, solved directly.)
-
-- The objective is base's L summed over the B trajectories.
-
-Practical additions beyond the base model (needed for this experiment; noted where they
-appear): observation-time resampling onto the Chebyshev grid (``obs_times'', as in
-node_pyomo_admm.py), and an optional ``seed'' for reproducible initialisation.
+Monolithic training of collocation-based Neural ODE over B independent trajectories. 
+The NLP is block diagonal: each trajectory has its own set of variables and constraints,
+and the coupling between trajectories is only through the shared parameters. 
 """
 import os
 import time
@@ -40,7 +29,10 @@ class NODEPyomo:
             param_lower_bound: float, param_upper_bound: float,
             l2_reg_param: float,
             obs_times: np.ndarray, 
-            seed: int = None
+            seed: int = None,
+            transcription_method: str = 'dc',
+            irrdc_param: float = None,
+            num_res_eval_nodes: int = None
     ):
         self.rng = np.random.default_rng(seed) # if seed = None -> nondeterministic; int -> reproducible
         self.Y_obs = Y_obs
@@ -65,21 +57,40 @@ class NODEPyomo:
         self.state_upper_bound = state_upper_bound
         self.param_lower_bound = param_lower_bound
         self.param_upper_bound = param_upper_bound
-        self.transcription_method = 'dc'
+        self.transcription_method = transcription_method
 
         # Single collocation grid shared by every segment.
         # The full block-diagonal differentiation matrix is this N x N grid repeated once per
         # segment; we store only the block and offset by segment when indexing the global node index.
-        bary = BarycentricInterpolation(0, self.end_time, self.num_colloc_nodes, transcription_method='dc')
+        bary = BarycentricInterpolation(
+            0, self.end_time,
+            self.num_colloc_nodes,
+            transcription_method=self.transcription_method,
+            num_res_eval_nodes=num_res_eval_nodes
+        )
         self.colloc_grid = bary.colloc_grid # (N,) ascending, colloc_grid[0] == 0
         self.bary_ws = bary.bary_ws
         self.D_colloc = bary.D_colloc # (N, N) local differentiation block
+
+        # IRR-DC: every segment shares the same residual-evaluation grid on [0, T], so (like D_colloc)
+        # L_res / D_res are stored as the (M, N) local blocks of block-diagonal (B*M, B*N) operators.
+        if self.transcription_method == 'irrdc':
+            if irrdc_param is None or num_res_eval_nodes is None:
+                raise ValueError("Need to set hyperparameter irrdc_param and num_res_eval_nodes for irrdc method.")
+            self.num_res_eval_nodes = num_res_eval_nodes
+            self.res_eval_grid = bary.res_eval_grid
+            self.L_res = bary.L_res # (M, N) local interpolant-evaluation block
+            self.D_res = bary.D_res # (M, N) local residual-differentiation block
+            self.irrdc_param = irrdc_param # regularisation hyperparameter for residual penalty term
+            self.quadrature_ws = bary.quadrature_ws # (M,) quadrature weights, shared by every segment
 
         # Interpolate each raw trajectory onto the collocation grid via obs_times. 
         self.Y_seg = np.empty((self.num_segments, self.num_colloc_nodes, self.state_dim), dtype=float)
         for s in range(self.num_segments):
             self.Y_seg[s] = CubicSpline(self.obs_times, self.Y_obs[s], axis=0)(self.colloc_grid)
         self.total_nodes = self.num_segments * self.num_colloc_nodes
+        if self.transcription_method == 'irrdc':
+            self.total_res_nodes = self.num_segments * self.num_res_eval_nodes
         self.Y_obs = self.Y_seg.reshape(self.total_nodes, self.state_dim)  
 
         self.model = pyo.ConcreteModel()
@@ -107,6 +118,18 @@ class NODEPyomo:
         segment in the block-diagonal differentiation operator.'''
         def init_rule(model, n, n_prime):
             return self.D_colloc[n-1, n_prime-1]  # self.D_colloc is a 0-indexed ndarray
+        return init_rule
+
+    def initialise_interpolant_eval_matrix(self):
+        '''Initialisation of the (local, per-segment) interpolant evaluation matrix as a pyomo Param.'''
+        def init_rule(model, m, n):
+            return self.L_res[m-1, n-1] # self.L_res is a 0-indexed ndarray
+        return init_rule
+
+    def initialise_res_diff_matrix(self):
+        '''Initialisation of the (local, per-segment) residual-evaluation differentiation matrix as a pyomo Param.'''
+        def init_rule(model, m, n):
+            return self.D_res[m-1, n-1] # self.D_res is a 0-indexed ndarray
         return init_rule
 
     def initialise_Y_star(self):
@@ -148,6 +171,21 @@ class NODEPyomo:
     def dc_objective_rule(self, model):
         return sum(self.single_traj_objective_rule(model, s0) for s0 in range(self.num_segments))
 
+    def irrdc_objective_rule(self, model, nn_output_res):
+        '''Returns the objective function for IRR-DC: base's IRR-DC objective summed over the B segments.'''
+        reg_mse = self.dc_objective_rule(model)
+
+        # Residual penalty term: (1 / (2 * mu)) * sum_b sum_m(w_m * ||r_b,m||_2^2). Summing over every
+        # global residual node r is the sum over segments; w is the same per segment, hence the local index.
+        M = self.num_res_eval_nodes
+        residual_penalty = (1 / (2 * self.irrdc_param)) * sum(
+            self.quadrature_ws[(r - 1) % M] * (model.ode_lhs_res[r, d] - nn_output_res[r-1, d-1])**2
+            for r in model.m
+            for d in model.d
+        )
+
+        return reg_mse + residual_penalty
+
     def build_model(self):
 
         # ------------ SETS ------------
@@ -155,6 +193,9 @@ class NODEPyomo:
         self.model.n = pyo.RangeSet(self.total_nodes)           # ALL collocation nodes across every segment
         self.model.d = pyo.RangeSet(self.state_dim)
         self.model.nloc = pyo.RangeSet(self.num_colloc_nodes)   # local node index within a segment
+        if self.transcription_method == 'irrdc':
+            self.model.m = pyo.RangeSet(self.total_res_nodes)          # ALL residual eval nodes across every segment
+            self.model.mloc = pyo.RangeSet(self.num_res_eval_nodes)    # local residual eval node index within a segment
 
         # ----- DECISION VARIABLES -----
         # Approximate state trajectory over all stacked nodes
@@ -216,12 +257,54 @@ class NODEPyomo:
         # Output of the shared NN at every (stacked) collocation node
         nn_output_colloc = self.nn_feedforward_pyo(self.model.Y_star, self.total_nodes)
 
-        # Build Pyomo objective and constraints (DC)
-        self.build_objective()
+        #----- INTEGRATED RESIDUAL OBJECTIVE -------
+        if self.transcription_method == 'irrdc':
+            # Local (per-segment) M x N interpolation / differentiation blocks as pyomo Params
+            self.model.L_res = pyo.Param(
+                self.model.mloc,
+                self.model.nloc,
+                domain=pyo.Reals,
+                initialize=self.initialise_interpolant_eval_matrix()
+            )
+            self.model.D_res = pyo.Param(
+                self.model.mloc,
+                self.model.nloc,
+                domain=pyo.Reals,
+                initialize=self.initialise_res_diff_matrix()
+            )
+
+            # LHS of ODE_res (dinterpolant/dt) and the interpolant Y_res at each global residual node --
+            # BLOCK DIAGONAL: both use ONLY the collocation nodes of the residual node's own segment.
+            def ode_lhs_res_rule(model, r, d):
+                s0 = (r - 1) // self.num_res_eval_nodes       # segment (0-indexed)
+                mloc = (r - 1) % self.num_res_eval_nodes + 1  # local residual node within the segment (1-indexed)
+                offset = s0 * self.num_colloc_nodes
+                return sum(model.D_res[mloc, j] * model.Y_star[offset + j, d] for j in model.nloc)
+            self.model.ode_lhs_res = pyo.Expression(self.model.m, self.model.d, rule=ode_lhs_res_rule)
+
+            def Y_res_rule(model, r, d):
+                s0 = (r - 1) // self.num_res_eval_nodes
+                mloc = (r - 1) % self.num_res_eval_nodes + 1
+                offset = s0 * self.num_colloc_nodes
+                return sum(model.L_res[mloc, j] * model.Y_star[offset + j, d] for j in model.nloc)
+            self.model.Y_res = pyo.Expression(self.model.m, self.model.d, rule=Y_res_rule)
+
+            # Output of the shared NN at every (stacked) residual evaluation node
+            nn_output_res = self.nn_feedforward_pyo(self.model.Y_res, self.total_res_nodes)
+
+        else:
+            nn_output_res = None
+
+        # Build Pyomo objective and constraints based on transcription method used
+        self.build_objective(nn_output_res)
         self.build_constraints(nn_output_colloc)
 
-    def build_objective(self):
-        self.model.obj = pyo.Objective(rule=lambda m: self.dc_objective_rule(m), sense=pyo.minimize)
+    def build_objective(self, nn_output_res):
+        if self.transcription_method == 'dc':
+            self.model.obj = pyo.Objective(rule=lambda m: self.dc_objective_rule(m), sense=pyo.minimize)
+
+        elif self.transcription_method == 'irrdc' and nn_output_res is not None:
+            self.model.obj = pyo.Objective(rule=lambda m: self.irrdc_objective_rule(m, nn_output_res), sense=pyo.minimize)
 
     def build_constraints(self, nn_output_colloc):
         # ODE equality constraint dY_star/dt = NN(Y_star) at every node EXCEPT each segment's

@@ -1,3 +1,6 @@
+"""
+ADMM-based training of collocation-based Neural ODE over B independent trajectories.  
+"""
 import warnings
 import numpy as np 
 import time
@@ -7,13 +10,13 @@ import pyomo.environ as pyo
 from pyomo.opt import SolverStatus, TerminationCondition
 from pyomo.common.errors import ApplicationError
 
-from src.models.simultaneous.direct_collocation import BarycentricInterpolation
+from src.models.simultaneous.barycentric_lagrange_collocation import BarycentricInterpolation
 
 class NODEPyomo:
-    """
+    '''
     Implementation of a base Pyomo model to train collocation-based Neural ODEs using the IPOPT solver. 
     Additional methods for ADMM-based batched training are implemented.
-    """
+    '''
     def __init__(self, 
             Y_obs: np.ndarray, 
             layer_sizes: list, 

@@ -217,7 +217,8 @@ class FedBatchSim:
 
         # LHS sampling for initial conditions
         lhs = LatinHypercube(
-            d=len(self.X_names), scramble=True, strength=1, optimization="random-cd"
+            d=len(self.X_names), scramble=True, strength=1, optimization="random-cd",
+            seed=getattr(self, "seed", None),  # np.random.seed does not reach scipy's QMC engine
         ).random(n=n_batch)
         initial_conditions = lhs * (self.X_max - self.X_min) + self.X_min
 

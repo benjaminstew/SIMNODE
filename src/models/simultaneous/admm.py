@@ -1,6 +1,6 @@
-'''
-multiprocessing wrapper to organize NODEPyomo submodels for ADMM-based batched training.
-'''
+"""
+Multiprocessing wrapper to organize NODEPyomo submodels for ADMM-based training, and ADMM algorithm logic.
+"""
 import os
 for thread_var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
     os.environ.setdefault(thread_var, "1")
