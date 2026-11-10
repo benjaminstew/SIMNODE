@@ -37,7 +37,7 @@ class KnottedNODEPyomo:
     ):
         '''
         Args:
-            trajs: list of trajectory dicts from feed_data.load_feed_trajectories(), each with
+            trajs: list of trajectory dicts from fedbatch_loader.load_feed_trajectories(), each with
                 'obs_times' (n_b,), 'Y_obs' (n_b, D), 'y0' (D,), 'feed_times' (K_b,), 'feed_amounts' (K_b,)
             num_colloc_nodes: Chebyshev-Lobatto nodes PER PHASE (N)
             jump_state_idx: 0-based column of Y_obs that the bolus is added to (G)
@@ -210,7 +210,7 @@ class KnottedNODEPyomo:
             (1/n_obs_b) sum_obs ||y~(t_obs) - y_obs||^2  +  lambda ||theta||_2^2
         where y~(t_obs) is the phase interpolant evaluated at the observation time through its
         barycentric row L. Reduces to the monolithic DC objective when observations sit on nodes.
-        The L2 term is added once per trajectory, matching node_pyomo_monolithic.py.'''
+        The L2 term is added once per trajectory, matching node_pyomo_mono.py.'''
         N = self.num_colloc_nodes
         mse = (1 / self.num_obs[b]) * sum(
             (sum(L_row[j-1] * model.Y_star[offset + j, d] for j in model.nloc if L_row[j-1] != 0.0)
@@ -374,7 +374,7 @@ class KnottedNODEPyomo:
         '''
         Feedforward pass of the NN (tanh hidden layers, linear output) over a stack of nodes.
         Y is a 1-indexed pyo Var/Expression (node, state). Returns a (num_nodes, out) ndarray of
-        pyo.Expressions. (Copied verbatim from node_pyomo_monolithic.py.)
+        pyo.Expressions. (Copied verbatim from node_pyomo_mono.py.)
         '''
         activations = [Y]
         for l in self.model.l:
@@ -402,7 +402,7 @@ class KnottedNODEPyomo:
     def solve_model(self, solver_options: dict):
         '''
         Solve the knotted monolithic Pyomo model using the IPOPT solver.
-        (Copied verbatim from node_pyomo_monolithic.py.)
+        (Copied verbatim from node_pyomo_mono.py.)
 
         Returns:
             self.last_solve_info dict.
@@ -580,7 +580,7 @@ class KnottedNODEPyomo:
         '''
         Mean / std over trajectories of the per-trajectory MSE (over observation times x states)
         of the piecewise forward prediction, each started from that trajectory's y0 and using its
-        own feed schedule. trajs is a list of dicts as returned by feed_data.load_feed_trajectories()
+        own feed schedule. trajs is a list of dicts as returned by fedbatch_loader.load_feed_trajectories()
         (train or test set). Returns (mean, std) or, with return_range, (mean, std, min, max);
         nan(s) if any forward solve fails.
         '''

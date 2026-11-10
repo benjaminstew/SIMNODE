@@ -4,14 +4,14 @@ Preliminary PS-knotting experiment on the fed-batch bioreactor data with bolus f
 Trains the knotted monolithic collocation NODE (KnottedNODEPyomo: one Chebyshev-Lobatto polynomial
 per phase, a FIXED HARD KNOT G^+ = G^- + a_k at every feed) on a train split and evaluates it by
 piecewise forward rollout of the trained network (restart at each feed) on the train and test sets.
-Results, solver info and the trained weights go to one JSON file.
+Results, solver info and the trained weights go to one JSON file in data/bioreactor_simulation/results/.
 
 Examples:
     OMP_NUM_THREADS=1 python -m data.bioreactor_simulation.run_knotting_training \
-        --results_path results/knotting/prelim_N8_B10.json --num_train 10 --num_test 10 --num_colloc_nodes 8
+        --results_path prelim_N8_B10.json --num_train 10 --num_test 10 --num_colloc_nodes 8
 
     OMP_NUM_THREADS=1 python -m data.bioreactor_simulation.run_knotting_training \
-        --results_path results/knotting/irrdc.json --transcription_method irrdc --irrdc_param 1.0 --num_res_eval_nodes 11
+        --results_path irrdc.json --transcription_method irrdc --irrdc_param 1.0 --num_res_eval_nodes 11
 
 (OMP_NUM_THREADS=1 avoids the libHSL/OpenMP crash on exit of the local /usr/local/bin/ipopt.)
 """
@@ -23,10 +23,11 @@ from pathlib import Path
 
 import numpy as np
 
-from data.bioreactor_simulation.feed_data import STATE_VARS, load_feed_trajectories, summarise_blocks, build_phase_blocks
+from data.bioreactor_simulation.raw_data.fedbatch_loader import STATE_VARS, load_feed_trajectories, summarise_blocks, build_phase_blocks
 from src.models.simultaneous.node_pyomo_mono_knotting import KnottedNODEPyomo
 
 RAW = Path(__file__).resolve().parent / "raw_data"
+RESULTS = Path(__file__).resolve().parent / "results"
 DEFAULT_TRAIN = RAW / "trainset_60trajectories_30points_0.0noise_feed.csv"
 DEFAULT_TEST = RAW / "testset_40trajectories_30points_0.0noise_feed.csv"
 JUMP_STATE_IDX = STATE_VARS.index('G')
@@ -45,7 +46,9 @@ def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--train_data_path", type=Path, default=DEFAULT_TRAIN)
     p.add_argument("--test_data_path", type=Path, default=DEFAULT_TEST)
-    p.add_argument("--results_path", type=Path, required=True, help="Output .json (parent dirs are created).")
+    p.add_argument("--results_path", type=Path, required=True,
+                   help="Output .json. A relative path is placed under data/bioreactor_simulation/results/ "
+                        "(subdirs are created); an absolute path is used as-is.")
     p.add_argument("--num_train", type=int, default=None, help="Training trajectories to use (default: all in the file).")
     p.add_argument("--num_test", type=int, default=None, help="Test trajectories to use (default: all in the file).")
     p.add_argument("--split_seed", type=int, default=0, help="Seed for the random choice of train/test subsets.")
@@ -65,6 +68,8 @@ def main():
     p.add_argument("--acceptable_iter", type=int, default=15)
     p.add_argument("--print_level", type=int, default=5)
     args = p.parse_args()
+    if not args.results_path.is_absolute():
+        args.results_path = RESULTS / args.results_path
     if args.transcription_method == "irrdc" and (args.irrdc_param is None or args.num_res_eval_nodes is None):
         p.error("--transcription_method irrdc needs --irrdc_param and --num_res_eval_nodes")
 

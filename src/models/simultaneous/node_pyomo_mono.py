@@ -14,7 +14,7 @@ import pyomo.environ as pyo
 from pyomo.opt import SolverStatus, TerminationCondition
 from pyomo.common.errors import ApplicationError
 
-from src.models.simultaneous.direct_collocation import BarycentricInterpolation
+from src.models.simultaneous.barycentric_lagrange_collocation import BarycentricInterpolation
 
 class NODEPyomo:
     """

@@ -13,8 +13,8 @@ import time
 import numpy as np
 import torch
 
-from src.models.simultaneous.admm_mp import ADMM
-from src.models.simultaneous.node_pyomo_monolithic import NODEPyomo as MonolithicNODEPyomo
+from src.models.simultaneous.admm import ADMM
+from src.models.simultaneous.node_pyomo_mono import NODEPyomo as MonolithicNODEPyomo
 from src.models.sequential.node_torch_multitraj import train_sequential_multitraj
 
 def run_training(

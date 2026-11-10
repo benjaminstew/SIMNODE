@@ -3,11 +3,11 @@ Script to run a training-set-size (B) scaling sweep and extract per-B training m
 
 Over mutliple runs (diff. seeds), sweeps the number of training trajectories B (with a fixed test set) 
 and, for each B, trains three Neural-ODE models on the same split:
--- monolithic collocation model (Pyomo/IPOPT, block-diagonal DC)   -> 'mono'
+-- monolithic collocation model (Pyomo/IPOPT, block-diagonal DC or IRR-DC) -> 'mono'
 -- ADMM consensus collocation model (Pyomo/IPOPT, DC or IRR-DC)    -> 'admm'
 -- sequential Neural ODE baseline (PyTorch / torchdiffeq)          -> 'seq'
 
-The ADMM transcription is chosen with --transcription_method (dc | irrdc). IRR-DC adds the
+The ADMM and monolithic transcription is chosen with --transcription_method (dc | irrdc). IRR-DC adds the
 integrated-residual penalty (1/(2 irrdc_param)) * sum_m w_m ||r(t_m)||^2 over an equidistant
 residual grid of --num_res_eval_nodes points, and needs one trajectory per ADMM subproblem.
 
@@ -162,7 +162,7 @@ def main():
                                 "s1_iter_per_traj": args.admm_s1_iter_per_traj, "s1_iter_floor": args.admm_s1_iter_floor}
                                if args.admm_iter_rule else None),
             "max_admm_iterations": None if args.admm_iter_rule else args.max_admm_iterations,
-            # ADMM transcription: 'dc' | 'irrdc'; the IRR-DC hyperparams are None for 'dc'
+            # ADMM + monolithic transcription: 'dc' | 'irrdc'; the IRR-DC hyperparams are None for 'dc'
             "transcription_method": args.transcription_method,
             "irrdc_param": args.irrdc_param,
             "num_res_eval_nodes": args.num_res_eval_nodes
@@ -348,12 +348,12 @@ if __name__ == "__main__":
                         help="L2 regularisation weight ν on the NN parameters (default 1e-3). "
                              "Applied to BOTH the ADMM and monolithic objectives.")
     parser.add_argument("--transcription_method", type=str, choices=("dc", "irrdc"), default="dc",
-                        help="ADMM-only: collocation transcription. 'dc' (default) = direct collocation; "
+                        help="Collocation transcription for ADMM and monolithic. 'dc' (default) = direct collocation; "
                              "'irrdc' = DC plus the integrated-residual penalty "
                              "(1/(2 irrdc_param)) * sum_m w_m ||dY/dt(t_m) - NN(Y(t_m))||^2 over an "
                              "equidistant residual grid. Requires --irrdc_param and --num_res_eval_nodes, "
                              "and one trajectory per subproblem (--num_batches_per_subp 1, no "
-                             "--subp_size_rule). The monolithic baseline is always plain DC.")
+                             "--subp_size_rule).")
     parser.add_argument("--irrdc_param", type=float, default=None,
                         help="IRR-DC: residual penalty weight μ; the penalty is scaled by 1/(2μ), so a "
                              "LARGER μ gives a WEAKER residual term. Required with --transcription_method irrdc.")
